@@ -11,6 +11,7 @@ import sys
 from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from .detectors import run_all
 from .report import render
+from .schema import SpendEvent
 from .store import SpendStore
 
 # Mock data, fixed timestamps -> deterministic self-check. research-bot has a small
@@ -65,9 +66,11 @@ def demo() -> None:
     # --- self-check: full closed loop (ledger sums + both detectors fire) ---
     spikes = [a for a in alerts if a.kind == "spend_spike"]
     burns = [a for a in alerts if a.kind == "budget_burn"]
+    kinds = {a.kind for a in alerts}
     assert 7.40 < store.total() < 7.45, store.total()
     assert len(spikes) == 1 and spikes[0].subject == "research-bot", spikes
     assert any(b.subject == "team-support" for b in burns), burns
+    assert {"budget_burn_rate", "spend_per_task", "new_merchant_provider"} <= kinds, kinds
     print("[self-check] ledger + spend-spike + budget-burn alert + report -- OK")
 
     # offline check of the on-chain x402 decoder used by `pull-x402` (no network)
@@ -86,6 +89,26 @@ def demo() -> None:
     _se = from_stripe_events([_evt])[0]
     assert _se.billed_cost == 42.0 and _se.rail == "card" and _se.x_agent_id == "ops-bot", _se
     print("[self-check] Stripe payment mapping -- OK")
+
+    _security_store = SpendStore()
+    _security_store.ingest([
+        SpendEvent(f"base-{i}", f"2026-06-29T0{i}:00:00Z", "llm_token", "openai", "gpt-5",
+                   1.0, "USD", 1, "usd", "known-key", "security-test", x_receipt_ref=f"base-{i}")
+        for i in range(1, 5)
+    ])
+    _security_store.ingest([
+        SpendEvent("new-key", "2026-06-29T05:00:00Z", "llm_token", "openai", "gpt-5",
+                   20.0, "USD", 1, "usd", "new-key", "security-test", x_receipt_ref="new-key"),
+        SpendEvent("old-merchant", "2026-06-29T01:00:00Z", "card", "stripe", "checkout",
+                   1.0, "USD", 1, "payment", "buyer-bot", "security-test",
+                   x_merchant_id="merchant-a", x_receipt_ref="old-merchant"),
+        SpendEvent("new-merchant", "2026-06-29T06:00:00Z", "card", "stripe", "checkout",
+                   2.0, "USD", 1, "payment", "buyer-bot", "security-test",
+                   x_merchant_id="merchant-b", x_receipt_ref="new-merchant"),
+    ])
+    _security_kinds = {a.kind for a in run_all(_security_store, {"security-test": 10.0})}
+    assert {"new_key_spike", "new_merchant_provider", "budget_burn_rate"} <= _security_kinds, _security_kinds
+    print("[self-check] Phase-0 security detectors -- OK")
 
 
 def pull() -> None:

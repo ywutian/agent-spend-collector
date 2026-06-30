@@ -58,7 +58,7 @@ OpenAI and OpenRouter can follow the Anthropic cost-report shape.
 | `store.py` | Append-only, idempotent SQLite ledger + summaries |
 | `adapters.py` | Normalizers: token usage / x402 settlements / Stripe events -> ledger rows |
 | `sources.py` | Live read-only pulls: Anthropic cost API, Base USDC logs, Stripe Events API |
-| `detectors.py` | Phase-0 anomaly signals: per-agent robust z-score, budget burn-rate |
+| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
 | `report.py` | Zero-dependency static HTML dashboard |
 
 ## The detection ceiling
@@ -78,7 +78,8 @@ detect -> inline -> on-chain
 2. Done: real Anthropic cost pull (`pull`).
 3. Done: real x402 pull, on-chain USDC on Base (`pull-x402`).
 4. Done: Stripe Events rail, token + crypto + card in one ledger (`pull-stripe`).
-5. Next: Grafana/Metabase on the DB; richer detectors (multi-window burn-rate, LLMjacking signals).
-6. Later: inline enforcement (gateway/middleware), Phase 1.
+5. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
+6. Next: Grafana/Metabase on the DB; LLMjacking-specific enrichments.
+7. Later: inline enforcement (gateway/middleware), Phase 1.
 
 Requires Python 3.10+. No dependencies. License: MIT.
