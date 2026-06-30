@@ -12,10 +12,16 @@ from datetime import datetime, timezone
 
 from .schema import SpendEvent, source_ref
 
-# ponytail: tiny static price book (USD per 1M tokens: input, output). Swap for
-# `tokencost` (MIT, 400+ models) when you need real/maintained pricing.
+# ponytail: small static price book (approximate USD per 1M tokens: input, output).
+# Approximate list prices; swap for `tokencost` (MIT, 400+ models) for accuracy/coverage.
 _PRICES = {
     "gpt-5": (1.25, 10.0),
+    "gpt-4o-mini": (0.15, 0.6),
+    "gpt-4o": (2.5, 10.0),
+    "gpt-4-turbo": (10.0, 30.0),
+    "gpt-3.5-turbo": (0.5, 1.5),
+    "o1": (15.0, 60.0),
+    "deepseek-chat": (0.27, 1.1),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-haiku-4-5": (0.8, 4.0),
 }
@@ -23,6 +29,11 @@ _PRICES = {
 
 def _price(model: str, input_tokens: int, output_tokens: int) -> float:
     pin, pout = _PRICES.get(model, (0.0, 0.0))
+    if (pin, pout) == (0.0, 0.0):  # dated ids like gpt-4o-2024-08-06 -> longest-prefix match
+        for key in sorted(_PRICES, key=len, reverse=True):
+            if model.startswith(key):
+                pin, pout = _PRICES[key]
+                break
     return (input_tokens * pin + output_tokens * pout) / 1_000_000
 
 
