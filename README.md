@@ -31,10 +31,14 @@ python3 -m spend_collector pull
 
 # x402 payments — USDC settlements into your merchant address on Base (no key, public RPC)
 python3 -m spend_collector pull-x402 0xYourReceivingAddress
+
+# card payments — Stripe succeeded charges (restricted read key)
+export STRIPE_API_KEY=rk_live_...
+python3 -m spend_collector pull-stripe
 ```
 
-Both write to `spend.db` and run the detectors. LLM attribution = one API key per agent;
-x402 attribution = payer wallet. OpenAI / OpenRouter follow the Anthropic shape.
+All write to `spend.db` and run the detectors. Attribution: LLM = one API key per agent,
+x402 = payer wallet, Stripe = `metadata.agent_id`. OpenAI / OpenRouter follow the Anthropic shape.
 
 ## What's inside
 
@@ -59,7 +63,7 @@ backstop is on-chain caps (ERC-7715 / Coinbase Spend Permissions). That's the
 1. ✅ Closed loop on mock data (ingest → ledger → detect → report).
 2. ✅ Real Anthropic cost pull (`pull`).
 3. ✅ Real x402 pull — on-chain USDC on Base (`pull-x402`).
-4. Stripe Events rail → token + crypto + card in one ledger.
+4. ✅ Stripe Events rail — token + crypto + card in one ledger (`pull-stripe`).
 5. Grafana/Metabase on the DB; richer detectors (multi-window burn-rate, LLMjacking signals).
 6. Inline enforcement (gateway/middleware) — Phase 1.
 

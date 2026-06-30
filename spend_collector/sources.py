@@ -2,6 +2,7 @@
 
 - LLM token: Anthropic Cost & Usage API (admin key). OpenAI / OpenRouter share the shape.
 - x402: USDC Transfer events into a merchant address on Base, via a public RPC (no key).
+- card: Stripe succeeded PaymentIntents via the Events API (restricted read key).
 Zero deps (stdlib urllib). Attribution works when each agent holds its own key/wallet.
 """
 from __future__ import annotations
@@ -143,3 +144,65 @@ def fetch_base_usdc_transfers(pay_to: str, *, rpc_url: str = BASE_RPC, usdc: str
             "agent_id": d["from"], "budget_id": "default",
         })
     return rows
+
+
+# --- card / Stripe payments, read-only via the Events API ---
+_STRIPE_URL = "https://api.stripe.com/v1/events"
+
+
+def env_stripe_key() -> str | None:
+    return os.environ.get("STRIPE_API_KEY")
+
+
+def _unix_iso(ts) -> str:
+    return datetime.fromtimestamp(int(ts or 0), tz=timezone.utc).isoformat()
+
+
+def _stripe_row(event: dict) -> dict:
+    """Map a raw Stripe `payment_intent.succeeded` event -> normalized row. Pure."""
+    pi = event.get("data", {}).get("object", {})
+    meta = pi.get("metadata") or {}
+    return {
+        "id": pi.get("id") or event.get("id", ""),
+        "amount_usd": (pi.get("amount_received") or pi.get("amount") or 0) / 100.0,
+        "currency": (pi.get("currency") or "usd").upper(),
+        "agent_id": meta.get("agent_id", "unknown"),
+        "budget_id": meta.get("budget_id", "default"),
+        "merchant": pi.get("on_behalf_of") or meta.get("merchant", "stripe"),
+        "event_time": _unix_iso(event.get("created", 0)),
+    }
+
+
+def fetch_stripe_payments(api_key: str, limit: int = 100) -> list[dict]:
+    """Read-only: recent succeeded PaymentIntents via the Stripe Events API. Use a
+    restricted read key. ponytail: single page; paginate with starting_after for
+    >limit. Events retain 30 days — persist what you pull.
+    """
+    url = f"{_STRIPE_URL}?type=payment_intent.succeeded&limit={limit}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    return [_stripe_row(e) for e in data.get("data", [])]
+
+
+def from_stripe_payments(rows: list[dict]) -> list[SpendEvent]:
+    """Stripe payment rows -> SpendEvents (card rail; amount already in major units)."""
+    out = []
+    for r in rows:
+        out.append(SpendEvent(
+            event_id=f"stripe:{r['id']}",
+            event_time=r["event_time"],
+            rail="card",
+            provider_name="stripe",
+            service_name=r["merchant"],
+            billed_cost=r["amount_usd"],
+            billing_currency=r["currency"],
+            consumed_quantity=1,
+            pricing_unit="charge",
+            x_agent_id=r["agent_id"],
+            x_budget_id=r["budget_id"],
+            x_merchant_id=r["merchant"],
+            x_receipt_ref=r["id"],
+            charge_category="Purchase",
+        ))
+    return out

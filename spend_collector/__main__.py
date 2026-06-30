@@ -78,6 +78,15 @@ def demo() -> None:
     assert _d["to"] == "0x" + "22" * 20 and _d["amount_raw"] == 2_500_000 and _d["block"] == 16, _d
     print("[self-check] x402 Transfer decoder -- OK")
 
+    # offline check of the Stripe payment mapping used by `pull-stripe`
+    from .sources import _stripe_row, from_stripe_payments
+    _evt = {"id": "evt_1", "created": 1781740800,
+            "data": {"object": {"id": "pi_1", "amount_received": 4200, "currency": "usd",
+                                 "metadata": {"agent_id": "ops-bot", "budget_id": "team-ops"}}}}
+    _se = from_stripe_payments([_stripe_row(_evt)])[0]
+    assert _se.billed_cost == 42.0 and _se.rail == "card" and _se.x_agent_id == "ops-bot", _se
+    print("[self-check] Stripe payment mapping -- OK")
+
 
 def pull() -> None:
     """Pull real cost data from the Anthropic Cost API (read-only, admin key)."""
@@ -114,6 +123,23 @@ def pull_x402() -> None:
         print(f"  [{a.severity}] {a.kind} {a.subject} {a.detail}")
 
 
+def pull_stripe() -> None:
+    """Pull real card payments via the Stripe Events API (read-only, restricted key)."""
+    from .sources import env_stripe_key, fetch_stripe_payments, from_stripe_payments
+    key = env_stripe_key()
+    if not key:
+        print("Set STRIPE_API_KEY (restricted read key) to pull card payments:\n"
+              "  export STRIPE_API_KEY=rk_live_...\n"
+              "  python3 -m spend_collector pull-stripe")
+        sys.exit(1)
+    store = SpendStore("spend.db")
+    n = store.ingest(from_stripe_payments(fetch_stripe_payments(key)))
+    print(f"ingested {n} Stripe payments -> spend.db")
+    _print_summary(store)
+    for a in run_all(store, {}):
+        print(f"  [{a.severity}] {a.kind} {a.subject} {a.detail}")
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "demo"
     if cmd == "demo":
@@ -122,8 +148,10 @@ def main() -> None:
         pull()
     elif cmd == "pull-x402":
         pull_x402()
+    elif cmd == "pull-stripe":
+        pull_stripe()
     else:
-        print("usage: python3 -m spend_collector [demo|pull|pull-x402]")
+        print("usage: python3 -m spend_collector [demo|pull|pull-x402|pull-stripe]")
         sys.exit(1)
 
 
