@@ -83,17 +83,18 @@ def fetch_anthropic_cost_report(admin_key: str, days: int = 7) -> list[dict]:
 
 
 def from_llm_cost_rows(rows, key_to_agent=None, key_to_budget=None) -> list[SpendEvent]:
-    """Cost-API rows (cost already USD) -> SpendEvents."""
+    """Cost-API rows (cost already USD) -> SpendEvents. Row may carry `provider`."""
     key_to_agent = key_to_agent or {}
     key_to_budget = key_to_budget or {}
     out = []
     for r in rows:
         key = r["api_key_id"]
+        provider = r.get("provider", "anthropic")
         out.append(SpendEvent(
-            event_id=f"llmcost:{key}:{r['model']}:{r['event_time']}",
+            event_id=f"llmcost:{provider}:{key}:{r['model']}:{r['event_time']}",
             event_time=r["event_time"],
             rail="llm_token",
-            provider_name="anthropic",
+            provider_name=provider,
             service_name=r["model"],
             billed_cost=r["amount_usd"],
             billing_currency="USD",
@@ -102,9 +103,46 @@ def from_llm_cost_rows(rows, key_to_agent=None, key_to_budget=None) -> list[Spen
             x_agent_id=key_to_agent.get(key, key),
             x_budget_id=key_to_budget.get(key, "default"),
             x_receipt_ref=key,
-            x_source_event=source_ref("anthropic", r),
+            x_source_event=source_ref(provider, r),
         ))
     return out
+
+
+# --- LLM token cost (OpenAI) ---
+_OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
+
+
+def env_openai_key() -> str | None:
+    return os.environ.get("OPENAI_ADMIN_KEY")
+
+
+def fetch_openai_costs(admin_key: str, days: int = 7) -> list[dict]:
+    """Pull daily cost buckets from the OpenAI Costs API, grouped by line_item + api_key_id.
+
+    OpenAI's `amount` is an object {value, currency} with value already in the main
+    unit (USD dollars, unlike Anthropic's cents). Verify against a real response.
+    """
+    start_time = int((datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp())
+    params = {"start_time": str(start_time), "bucket_width": "1d",
+              "group_by[]": ["line_item", "api_key_id"], "limit": "180"}
+    url = f"{_OPENAI_COSTS_URL}?{urllib.parse.urlencode(params, doseq=True)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {admin_key}"})
+    data = _request_json(req)
+
+    rows: list[dict] = []
+    for bucket in data.get("data", []):
+        ts = datetime.fromtimestamp(
+            int(bucket.get("start_time") or start_time), tz=timezone.utc).isoformat()
+        for item in bucket.get("results", []):
+            amount = item.get("amount") or {}
+            rows.append({
+                "amount_usd": float(amount.get("value", 0) or 0),
+                "api_key_id": item.get("api_key_id") or item.get("project_id") or "unknown",
+                "model": item.get("line_item") or "openai",
+                "event_time": ts,
+                "provider": "openai",
+            })
+    return rows
 
 
 # --- Stripe card / PaymentIntent rail (read-only Events API) ---

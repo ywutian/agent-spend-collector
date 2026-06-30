@@ -20,7 +20,9 @@ from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide
 from spend_collector.report import render
 from spend_collector.schema import COLUMNS, SpendEvent
-from spend_collector.sources import _env_int, _request_json, decode_transfer_log
+from spend_collector.sources import (
+    _env_int, _request_json, decode_transfer_log, fetch_openai_costs, from_llm_cost_rows,
+)
 from spend_collector.store import SpendStore
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -528,6 +530,31 @@ class CollectorTest(unittest.TestCase):
             self.addCleanup(lambda: os.environ.__setitem__("SPEND_HTTP_TIMEOUT", old))
 
         self.assertEqual(_env_int("SPEND_HTTP_TIMEOUT", 30), 30)
+
+    def test_from_llm_cost_rows_tags_provider(self) -> None:
+        rows = [{"amount_usd": 0.42, "api_key_id": "key-1", "model": "gpt-5",
+                 "event_time": "2026-06-30T00:00:00+00:00", "provider": "openai"}]
+        events = from_llm_cost_rows(rows)
+        self.assertEqual(events[0].provider_name, "openai")
+        self.assertEqual(events[0].billed_cost, 0.42)
+        self.assertEqual(events[0].rail, "llm_token")
+
+    def test_fetch_openai_costs_parses_amount_value(self) -> None:
+        import spend_collector.sources as sources
+        canned = {"data": [{"start_time": 1781740800, "results": [
+            {"amount": {"value": 0.42, "currency": "usd"},
+             "api_key_id": "key-1", "line_item": "gpt-5, input"}]}]}
+        original = sources._request_json
+        sources._request_json = lambda req: canned
+        try:
+            rows = fetch_openai_costs("sk-test")
+        finally:
+            sources._request_json = original
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["amount_usd"], 0.42)  # OpenAI value is dollars, not cents
+        self.assertEqual(rows[0]["provider"], "openai")
+        self.assertEqual(rows[0]["api_key_id"], "key-1")
+        self.assertEqual(rows[0]["model"], "gpt-5, input")
 
 
 if __name__ == "__main__":

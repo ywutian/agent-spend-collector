@@ -148,18 +148,30 @@ def demo(out_dir: str | Path = ".") -> None:
     print("[self-check] Stripe payment mapping -- OK")
 
 
-def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7) -> None:
-    """Pull real cost data from the Anthropic Cost API (read-only, admin key)."""
-    from .sources import env_admin_key, fetch_anthropic_cost_report, from_llm_cost_rows
-    key = env_admin_key()
-    if not key:
-        print("Set ANTHROPIC_ADMIN_KEY to pull real cost data:\n"
-              "  export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...\n"
-              "  python3 -m spend_collector pull")
-        sys.exit(1)
+def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
+         provider: str = "anthropic") -> None:
+    """Pull real LLM cost data (read-only admin key). provider: anthropic | openai."""
+    from .sources import (env_admin_key, env_openai_key, fetch_anthropic_cost_report,
+                          fetch_openai_costs, from_llm_cost_rows)
+    if provider == "openai":
+        key = env_openai_key()
+        if not key:
+            print("Set OPENAI_ADMIN_KEY to pull OpenAI cost data:\n"
+                  "  export OPENAI_ADMIN_KEY=sk-...\n"
+                  "  python3 -m spend_collector pull --provider openai")
+            sys.exit(1)
+        rows = fetch_openai_costs(key, days=days)
+    else:
+        key = env_admin_key()
+        if not key:
+            print("Set ANTHROPIC_ADMIN_KEY to pull real cost data:\n"
+                  "  export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...\n"
+                  "  python3 -m spend_collector pull")
+            sys.exit(1)
+        rows = fetch_anthropic_cost_report(key, days=days)
     with SpendStore(str(db_path)) as store:
-        n = store.ingest(from_llm_cost_rows(fetch_anthropic_cost_report(key, days=days)))
-        print(f"ingested {n} cost rows -> {db_path}")
+        n = store.ingest(from_llm_cost_rows(rows))
+        print(f"ingested {n} {provider} cost rows -> {db_path}")
         _finish_run(store, _load_budgets(), out_dir)
 
 
@@ -469,9 +481,11 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("demo", parents=[common], help="run the fixture-backed product demo")
 
-    pull_p = sub.add_parser("pull", parents=[common], help="pull Anthropic cost report rows")
+    pull_p = sub.add_parser("pull", parents=[common], help="pull LLM cost rows (Anthropic or OpenAI)")
     pull_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
     pull_p.add_argument("--days", type=int, default=7, help="days of provider history to request")
+    pull_p.add_argument("--provider", default="anthropic", choices=["anthropic", "openai"],
+                        help="LLM cost provider")
 
     x402_p = sub.add_parser("pull-x402", parents=[common],
                             help="pull Base USDC settlements into an x402 address")
@@ -518,7 +532,7 @@ def main(argv: list[str] | None = None) -> None:
     if cmd == "demo":
         demo(args.out_dir)
     elif cmd == "pull":
-        pull(args.db, args.out_dir, args.days)
+        pull(args.db, args.out_dir, args.days, args.provider)
     elif cmd == "pull-x402":
         pull_x402(args.db, args.out_dir, args.pay_to, args.lookback_blocks)
     elif cmd == "pull-stripe":
