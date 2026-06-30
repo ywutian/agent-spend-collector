@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import contextlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 import unittest
 from pathlib import Path
 
-from spend_collector.__main__ import _alert_row, _load_budgets, _run_summary, main
+from spend_collector.__main__ import _alert_row, _load_budgets, _run_summary, main, make_gateway_server
 from spend_collector.adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
+from spend_collector.gateway import GuardRequest, decide
 from spend_collector.report import render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import _env_int, _request_json, decode_transfer_log
@@ -29,6 +33,16 @@ def load_fixture(name: str):
 
 
 class CollectorTest(unittest.TestCase):
+    def wait_for_http(self, url: str) -> None:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        self.fail(f"server did not start: {url}")
+
     def build_demo_store(self) -> tuple[SpendStore, dict]:
         store = SpendStore()
         self.addCleanup(store.close)
@@ -150,6 +164,164 @@ class CollectorTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     main(["report", "--db", str(missing), "--out-dir", tmp])
             self.assertFalse(missing.exists())
+
+    def test_gateway_denies_spend_that_would_exceed_budget(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        store.ingest([SpendEvent(
+            "evt-budget", "2026-06-29T01:00:00Z", "api_x402", "x402", "/feed",
+            1.50, "USDC", 1, "call", "research-bot", "team-research",
+            x_merchant_id="0xfeed",
+        )])
+        decision = decide(store, {"budgets": {"team-research": 2.0}}, GuardRequest(
+            x_agent_id="research-bot",
+            rail="api_x402",
+            provider_name="x402",
+            service_name="/scrape",
+            x_merchant_id="0xtool",
+            amount=0.75,
+            x_budget_id="team-research",
+        ))
+
+        self.assertEqual(decision.decision, "deny")
+        self.assertTrue(any("would exceed cap" in r for r in decision.reasons))
+
+    def test_gateway_checks_agent_rail_amount_and_new_merchant_policy(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        request = GuardRequest(
+            x_agent_id="research-bot",
+            rail="card",
+            provider_name="stripe",
+            service_name="checkout",
+            x_merchant_id="new-vendor",
+            amount=12.0,
+            x_budget_id="team-research",
+        )
+        decision = decide(store, {
+            "deny_new_merchants": True,
+            "agents": {"research-bot": {"rails": ["llm_token", "api_x402"], "max_amount": 5.0}},
+        }, request)
+
+        self.assertEqual(decision.decision, "deny")
+        self.assertTrue(any("rail card is not allowed" in r for r in decision.reasons))
+        self.assertTrue(any("exceeds max" in r for r in decision.reasons))
+        self.assertTrue(any("has no ledger history" in r for r in decision.reasons))
+
+    def test_cli_guard_outputs_machine_readable_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"max_amount": 1.0}, f)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main([
+                    "guard",
+                    "--db", str(db_path),
+                    "--policy", str(policy_path),
+                    "--agent", "research-bot",
+                    "--rail", "api_x402",
+                    "--provider", "x402",
+                    "--merchant", "0xtool",
+                    "--service", "/scrape",
+                    "--amount", "3.50",
+                    "--budget", "team-research",
+                ])
+            payload = json.loads(stdout.getvalue())
+
+        self.assertFalse(payload["allowed"])
+        self.assertEqual(payload["decision"], "deny")
+        self.assertTrue(any("exceeds max" in r for r in payload["reasons"]))
+
+    def test_http_gateway_forward_allows_or_denies_without_prompts(self) -> None:
+        calls: list[dict] = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                calls.append(json.loads(body))
+                out = b'{"upstream": true}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, fmt, *args):
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        self.addCleanup(lambda: (upstream.shutdown(), upstream_thread.join(1), upstream.server_close()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            db_path = Path(tmp) / "spend.db"
+            policy = {
+                "max_amount": 1.0,
+                "targets": {
+                    "ok": {
+                        "url": f"http://127.0.0.1:{upstream.server_port}/ok",
+                        "rail": "api_x402",
+                        "provider": "x402",
+                        "merchant": "0xtool",
+                        "service": "/ok",
+                        "amount": 0.5,
+                        "budget": "team-research",
+                    },
+                    "blocked": {
+                        "url": f"http://127.0.0.1:{upstream.server_port}/blocked",
+                        "rail": "api_x402",
+                        "provider": "x402",
+                        "merchant": "0xtool",
+                        "service": "/blocked",
+                        "amount": 2.5,
+                        "budget": "team-research",
+                    },
+                },
+            }
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump(policy, f)
+
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (
+                gateway_server.shutdown(),
+                gateway_thread.join(1),
+                gateway_server.server_close(),
+            ))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            allow_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/forward",
+                data=json.dumps({"agent": "research-bot", "target": "ok", "body": {"q": "yes"}}).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(allow_req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(json.load(resp), {"upstream": True})
+            self.assertEqual(calls, [{"q": "yes"}])
+
+            deny_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/forward",
+                data=json.dumps({"agent": "research-bot", "target": "blocked", "body": {"q": "no"}}).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(deny_req, timeout=2)
+            self.assertEqual(err.exception.code, 403)
+            payload = json.loads(err.exception.read())
+            self.assertEqual(payload["decision"], "deny")
+            self.assertFalse(payload["allowed"])
+            self.assertNotIn("prompt", json.dumps(payload).lower())
+            self.assertEqual(calls, [{"q": "yes"}])
 
     def test_store_migrates_existing_ledgers_to_current_schema(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:

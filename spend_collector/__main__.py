@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from .detectors import run_all
+from .gateway import GuardRequest, decide
 from .report import render
 from .store import SpendStore
 
@@ -205,6 +209,159 @@ def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
         _finish_run(store, _load_budgets(), out_dir)
 
 
+def _load_policy(path: str | Path | None) -> dict:
+    if not path:
+        path = os.environ.get("SPEND_POLICY_FILE")
+    if not path:
+        return {}
+    return _load_json_file(path)
+
+
+def guard(args) -> dict:
+    req = GuardRequest(
+        x_agent_id=args.agent,
+        rail=args.rail,
+        amount=args.amount,
+        x_budget_id=args.budget,
+        provider_name=args.provider or "",
+        service_name=args.service or "",
+        x_merchant_id=args.merchant or "",
+        x_session_id=args.session or "",
+    )
+    with SpendStore(args.db) as store:
+        decision = decide(store, _load_policy(args.policy), req).as_dict()
+    print(json.dumps(decision, indent=2, sort_keys=True))
+    if not decision["allowed"] and args.enforce_exit_code:
+        sys.exit(2)
+    return decision
+
+
+def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Path | None = None,
+                        host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload, indent=2, sort_keys=True).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_bytes(self, code: int, body: bytes, headers: dict[str, str]) -> None:
+            self.send_response(code)
+            for key, value in headers.items():
+                if key.lower() in {"connection", "content-length", "transfer-encoding"}:
+                    continue
+                self.send_header(key, value)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self) -> dict:
+            length = int(self.headers.get("content-length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        def _guard_payload(self, payload: dict) -> dict:
+            req = GuardRequest(
+                x_agent_id=str(payload["agent"]),
+                rail=str(payload["rail"]),
+                amount=float(payload["amount"]),
+                x_budget_id=str(payload["budget"]),
+                provider_name=str(payload.get("provider", "")),
+                service_name=str(payload.get("service", "")),
+                x_merchant_id=str(payload.get("merchant", "")),
+                x_session_id=str(payload.get("session", "")),
+            )
+            with SpendStore(str(db_path)) as store:
+                return decide(store, _load_policy(policy_path), req).as_dict()
+
+        def _target_request(self, payload: dict, policy: dict) -> tuple[dict, dict]:
+            target_id = str(payload["target"])
+            target = policy.get("targets", {}).get(target_id)
+            if not isinstance(target, dict):
+                raise ValueError(f"target {target_id} is not configured")
+            guard_payload = {
+                "agent": payload["agent"],
+                "rail": target["rail"],
+                "amount": target["amount"],
+                "budget": payload.get("budget", target.get("budget", "default")),
+                "provider": target.get("provider", ""),
+                "service": target.get("service", ""),
+                "merchant": target.get("merchant", ""),
+                "session": payload.get("session", ""),
+            }
+            return target, guard_payload
+
+        def _forward(self, target: dict, payload: dict) -> None:
+            merged_headers = dict(target.get("headers", {}))
+            merged_headers.update(payload.get("headers", {}) or {})
+            headers = {
+                str(k): str(v)
+                for k, v in merged_headers.items()
+                if str(k).lower() not in {"host", "content-length", "connection"}
+            }
+            body = payload.get("body", b"")
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode()
+                headers.setdefault("content-type", "application/json")
+            elif isinstance(body, str):
+                body = body.encode()
+            elif body is None:
+                body = b""
+            method = str(target.get("method", "POST")).upper()
+            req = urllib.request.Request(str(target["url"]), data=body, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=float(target.get("timeout", 30))) as resp:
+                    self._send_bytes(resp.status, resp.read(), dict(resp.headers.items()))
+            except urllib.error.HTTPError as exc:
+                self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
+
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                self._send(200, {"ok": True})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self) -> None:
+            try:
+                payload = self._read_json()
+                if self.path == "/guard":
+                    decision = self._guard_payload(payload)
+                    self._send(200 if decision["allowed"] else 403, decision)
+                    return
+                if self.path == "/forward":
+                    policy = _load_policy(policy_path)
+                    target, guard_payload = self._target_request(payload, policy)
+                    decision = self._guard_payload(guard_payload)
+                    if not decision["allowed"]:
+                        self._send(403, decision)
+                        return
+                    self._forward(target, payload)
+                    return
+                self._send(404, {"error": "not found"})
+            except urllib.error.URLError as exc:
+                self._send(502, {"error": str(exc)})
+            except (KeyError, TypeError, ValueError) as exc:
+                self._send(400, {"error": str(exc)})
+
+        def log_message(self, fmt, *args):
+            return
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def gateway(db_path: str | Path = "spend.db", policy_path: str | Path | None = None,
+            host: str = "127.0.0.1", port: int = 8787) -> None:
+    """Run a tiny local HTTP gateway with POST /guard and POST /forward."""
+    server = make_gateway_server(db_path, policy_path, host, port)
+    print(f"spend gateway listening on http://{host}:{port}")
+    print("POST /guard for decisions; POST /forward to guard then proxy an allowlisted target")
+    server.serve_forever()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spend-collector",
@@ -238,6 +395,26 @@ def _parser() -> argparse.ArgumentParser:
                               help="regenerate dashboard from an existing ledger")
     report_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
 
+    guard_p = sub.add_parser("guard", help="pre-spend allow/deny decision")
+    guard_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    guard_p.add_argument("--policy", help="gateway policy JSON; defaults to SPEND_POLICY_FILE")
+    guard_p.add_argument("--agent", required=True, help="agent id asking to spend")
+    guard_p.add_argument("--rail", required=True, help="rail, e.g. llm_token, api_x402, card")
+    guard_p.add_argument("--amount", type=float, required=True, help="requested spend amount")
+    guard_p.add_argument("--budget", required=True, help="budget id")
+    guard_p.add_argument("--provider", help="provider, e.g. openai, x402, stripe")
+    guard_p.add_argument("--service", help="model, endpoint, or merchant service")
+    guard_p.add_argument("--merchant", help="merchant id/address")
+    guard_p.add_argument("--session", help="task/session id")
+    guard_p.add_argument("--enforce-exit-code", action="store_true",
+                         help="exit 2 on deny so callers can block the spend")
+
+    gateway_p = sub.add_parser("gateway", help="run local HTTP pre-spend gateway")
+    gateway_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    gateway_p.add_argument("--policy", help="gateway policy JSON; defaults to SPEND_POLICY_FILE")
+    gateway_p.add_argument("--host", default="127.0.0.1", help="bind host")
+    gateway_p.add_argument("--port", type=int, default=8787, help="bind port")
+
     return parser
 
 
@@ -254,6 +431,10 @@ def main(argv: list[str] | None = None) -> None:
         pull_stripe(args.db, args.out_dir, args.days, args.limit)
     elif cmd == "report":
         report(args.db, args.out_dir)
+    elif cmd == "guard":
+        guard(args)
+    elif cmd == "gateway":
+        gateway(args.db, args.policy, args.host, args.port)
 
 
 if __name__ == "__main__":

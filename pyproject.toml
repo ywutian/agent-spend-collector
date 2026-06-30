@@ -51,4 +51,5 @@ include = [
   "pyproject.toml",
   ".env.example",
   "budgets.example.json",
+  "gateway.example.json",
 ]

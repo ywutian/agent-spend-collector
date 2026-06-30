@@ -49,6 +49,42 @@ frequently and keep the SQLite ledger as the durable history.
 - Treat alerts as evidence for investigation or for future inline enforcement.
 - `report.html` shows a short evidence suffix, not the raw source payload.
 
+## Inline Gateway
+
+Use the gateway when an agent can ask before spending. Start with
+`gateway.example.json`, then tighten the policy per agent:
+
+```bash
+export SPEND_POLICY_FILE=gateway.example.json
+python3 -m spend_collector gateway --db spend.db --policy "$SPEND_POLICY_FILE"
+```
+
+Agents or middleware call `POST /guard` before an LLM call, x402 payment, or
+card-backed checkout. A `deny` response should block the spend; an `allow`
+response should continue and later land in the ledger through the normal pull.
+For allowlisted destinations, agents can call `POST /forward`; the gateway first
+runs the same policy check, then forwards the original body only when allowed.
+If denied, it returns JSON and does not call the destination.
+
+For shell-based integrations, use:
+
+```bash
+python3 -m spend_collector guard \
+  --policy gateway.example.json \
+  --agent research-bot \
+  --rail api_x402 \
+  --provider x402 \
+  --merchant 0xtool \
+  --service /scrape \
+  --amount 3.50 \
+  --budget team-research \
+  --enforce-exit-code
+```
+
+The gateway checks policy and ledger history only. It is the enforcement point
+when your agent, LLM proxy, or x402 middleware honors the decision.
+It does not return prompts, rewrite prompts, or inject model instructions.
+
 ## Failure Handling
 
 Live HTTP/RPC pulls use bounded timeouts and retries. If a pull fails, rerun it:

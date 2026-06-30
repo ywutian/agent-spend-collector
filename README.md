@@ -94,6 +94,58 @@ python3 -m spend_collector report
 python3 -m spend_collector report --db path/to/spend.db --out-dir artifacts
 ```
 
+## Pre-spend gateway
+
+The collector can also sit in front of agent spend. An agent asks before it
+spends; the gateway returns `allow` or `deny` from policy plus ledger history.
+
+Try a one-off decision:
+
+```bash
+python3 -m spend_collector guard \
+  --policy gateway.example.json \
+  --db spend.db \
+  --agent research-bot \
+  --rail api_x402 \
+  --provider x402 \
+  --merchant 0xtool \
+  --service /scrape \
+  --amount 3.50 \
+  --budget team-research \
+  --enforce-exit-code
+```
+
+Or run a local HTTP gateway:
+
+```bash
+python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
+```
+
+Then call it before a payment/model call:
+
+```bash
+curl -X POST http://127.0.0.1:8787/guard \
+  -H 'content-type: application/json' \
+  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":3.5,"budget":"team-research"}'
+```
+
+For calls the gateway should forward, define an allowlisted `targets` entry in
+`gateway.example.json`, then call `/forward`:
+
+```bash
+curl -X POST http://127.0.0.1:8787/forward \
+  -H 'content-type: application/json' \
+  -d '{"agent":"research-bot","target":"scraper-demo","body":{"query":"pricing data"}}'
+```
+
+The gateway checks the target's policy first. If allowed, it forwards the request
+body to the configured URL. If denied, it does not call the target and returns a
+JSON decision such as `{"decision":"deny","allowed":false,"reasons":[...]}`.
+It never returns prompts, rewrites prompts, or injects model instructions.
+
+This is the first inline-control layer: it does not move funds, but callers can
+block the spend when the decision is `deny`.
+
 ## Verify locally
 
 The project is stdlib-only. Run the test suite and product demo with:
@@ -164,6 +216,7 @@ OpenAI and OpenRouter can follow the Anthropic cost-report shape.
 | `adapters.py` | Normalizers: token usage / x402 settlements / Stripe events -> ledger rows |
 | `sources.py` | Live read-only pulls: Anthropic cost API, Base USDC logs, Stripe Events API |
 | `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
+| `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
 | `report.py` | Zero-dependency static HTML dashboard |
 
 ## The detection ceiling
@@ -186,7 +239,7 @@ detect -> inline -> on-chain
 3. Done: real x402 pull, on-chain USDC on Base (`pull-x402`).
 4. Done: Stripe Events rail, token + crypto + card in one ledger (`pull-stripe`).
 5. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-6. Next: Grafana/Metabase on the DB; LLMjacking-specific enrichments.
-7. Later: inline enforcement (gateway/middleware), Phase 1.
+6. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
+7. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
 Requires Python 3.10+. No dependencies. License: MIT.
