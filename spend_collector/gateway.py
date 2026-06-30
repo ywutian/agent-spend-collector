@@ -6,10 +6,14 @@ returns allow/deny.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from .adapters import _price
+from .schema import SpendEvent, source_ref
 from .store import SpendStore
 
 
@@ -269,3 +273,44 @@ def audit_config(policy: dict, *, db_path: str = "spend.db", out_dir: str = "art
 
 def cap_for_request(policy: dict, req: GuardRequest) -> float | None:
     return _budget_cap(policy, req.x_agent_id, req.x_budget_id)
+
+
+def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_payload: dict):
+    """Record a forwarded LLM call as a spend event from the response's token usage.
+
+    Closes the loop: a successful forward lands in the ledger with per-agent / budget
+    attribution. Only billing metadata (id, model, usage) is read -- no prompt or
+    response content is stored. Returns the event, or None when there is no usage
+    (e.g. a streamed response without usage stats).
+    """
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    usage = (data.get("usage") if isinstance(data, dict) else None) or {}
+    if not usage:
+        return None
+    pname = str(provider.get("provider", "openai"))
+    model = str(data.get("model") or guard_payload.get("service") or pname)
+    prompt = int(usage.get("prompt_tokens", 0) or 0)
+    completion = int(usage.get("completion_tokens", 0) or 0)
+    rid = str(data.get("id") or f"{guard_payload.get('agent', 'agent')}:{prompt}:{completion}")
+    event = SpendEvent(
+        event_id=f"gw:{rid}",
+        event_time=datetime.now(tz=timezone.utc).isoformat(),
+        rail="llm_token",
+        provider_name=pname,
+        service_name=model,
+        billed_cost=_price(model, prompt, completion),
+        billing_currency="USD",
+        consumed_quantity=prompt + completion,
+        pricing_unit="token",
+        x_agent_id=str(guard_payload.get("agent", "unknown")),
+        x_budget_id=str(guard_payload.get("budget", "default")),
+        x_session_id=str(guard_payload.get("session", "")),
+        x_merchant_id=pname,
+        x_receipt_ref=str(data.get("id", "")),
+        x_source_event=source_ref(pname, {"id": data.get("id"), "model": model, "usage": usage}),
+    )
+    store.ingest([event])
+    return event

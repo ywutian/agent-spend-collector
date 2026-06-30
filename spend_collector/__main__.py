@@ -19,6 +19,7 @@ from .gateway import (
     audit_config as build_audit_config,
     cap_for_request,
     decide,
+    record_forwarded_spend,
     require_valid_policy,
     validate_policy as validate_policy_data,
 )
@@ -310,7 +311,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_upstream(self, resp) -> None:
+        def _send_upstream(self, resp) -> bytes | None:
             headers = dict(resp.headers.items())
             content_type = headers.get("Content-Type", headers.get("content-type", ""))
             transfer = headers.get("Transfer-Encoding", headers.get("transfer-encoding", ""))
@@ -325,7 +326,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                return
+                return body
             self.end_headers()
             while True:
                 chunk = resp.read(8192)
@@ -333,6 +334,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+            return None
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("content-length", "0"))
@@ -479,7 +481,8 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             headers[auth_header] = f"{auth_prefix} {provider_key}".strip()
             return headers
 
-        def _forward_provider(self, provider: dict, suffix: str) -> None:
+        def _forward_provider(self, provider: dict, suffix: str,
+                              guard_payload: dict | None = None, request_id: str = "") -> None:
             url = str(provider["base_url"]).rstrip("/") + suffix
             method = str(provider.get("method", "POST")).upper()
             req = urllib.request.Request(
@@ -490,7 +493,14 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             )
             try:
                 with urllib.request.urlopen(req, timeout=float(provider.get("timeout", 30))) as resp:
-                    self._send_upstream(resp)
+                    raw = self._send_upstream(resp)
+                # Close the loop: record the actual spend, then release the pre-spend
+                # reservation so the budget reflects real usage, not the estimate.
+                if raw is not None and guard_payload is not None:
+                    with SpendStore(str(db_path)) as store:
+                        recorded = record_forwarded_spend(store, raw, provider, guard_payload)
+                        if recorded is not None and request_id:
+                            store.release_reservation(request_id)
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
@@ -535,7 +545,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     if not decision["allowed"]:
                         self._send(403, decision)
                         return
-                    self._forward_provider(provider, suffix)
+                    self._forward_provider(provider, suffix, guard_payload, decision.get("request_id", ""))
                     return
                 self._send(404, {"error": "not found"})
             except urllib.error.URLError as exc:
