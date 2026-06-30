@@ -68,9 +68,14 @@ def fetch_anthropic_cost_report(admin_key: str, days: int = 7) -> list[dict]:
     for bucket in data.get("data", []):
         ts = bucket.get("starting_at", start)
         for item in bucket.get("results", []):
+            # cost_report returns `amount` in lowest currency units (cents) as a string,
+            # e.g. "123.45" == $1.2345. Convert to USD. (Verify against a real response.)
+            cents = float(item.get("amount", item.get("cost", 0)) or 0)
             rows.append({
-                "amount_usd": float(item.get("amount", item.get("cost", 0)) or 0),
-                "api_key_id": item.get("api_key_id") or "unknown",
+                "amount_usd": cents / 100,
+                # cost_report groups by workspace/description; api_key_id grouping may be
+                # ignored (it's on the usage report). Fall back to workspace for attribution.
+                "api_key_id": item.get("api_key_id") or item.get("workspace_id") or "unknown",
                 "model": item.get("model") or "anthropic",
                 "event_time": ts,
             })
