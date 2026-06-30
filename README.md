@@ -22,10 +22,56 @@ python3 -m spend_collector demo
 Runs the full loop on mock data:
 
 ```text
-ingest -> one ledger -> anomaly detectors -> report.html
+fixtures -> one ledger -> anomaly detectors -> report.html
 ```
 
 Open `report.html` in a browser.
+
+## What the demo proves
+
+The demo is a small product story, not random sample data. It reads public fixtures
+from `fixtures/`:
+
+| Fixture | Purpose |
+|---|---|
+| `llm_usage.json` | LLM token baseline, runaway token spike, and a new high-spend key |
+| `x402_settlements.json` | Paid API calls settled in USDC on the x402 rail |
+| `stripe_events.json` | Stripe card payments with agent/budget metadata |
+| `budgets.json` | Team caps used by the budget detectors |
+
+Those fixtures intentionally trigger the core Phase-0 signals:
+
+| Signal | Why it fires |
+|---|---|
+| `spend_spike` | `research-bot` has four tiny LLM calls, then one runaway token-heavy call |
+| `spend_per_task` | The same runaway request is expensive versus the agent's task baseline |
+| `budget_burn` | `team-support` crosses its budget after x402 + Stripe + token spend |
+| `budget_burn_rate` | Recent spend is burning monthly budgets too quickly |
+| `new_key_spike` | `new-key-bot` appears for the first time with a large LLM charge |
+| `new_merchant_provider` | `support-bot` spends at a first-seen paid API/card merchant |
+
+The point is to prove the wedge: token cost, paid API spend, and card payments can
+land in one neutral ledger, and abnormal spend can become a security signal.
+
+## Dashboard
+
+Every command that ingests data runs the detectors. The `demo` command also writes
+the static dashboard:
+
+```bash
+python3 -m spend_collector demo
+open report.html
+```
+
+On Windows, open `report.html` from Explorer or run:
+
+```powershell
+start report.html
+```
+
+The dashboard shows total spend, alert counts, rail mix, budget burn, Phase-0
+security signals, agent-by-rail totals, and recent ledger events. It is a local
+HTML file with no server and no external assets.
 
 ## Real data (read-only)
 

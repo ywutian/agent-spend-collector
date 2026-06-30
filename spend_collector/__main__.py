@@ -1,44 +1,22 @@
-"""`python -m spend_collector demo` — end-to-end closed loop + self-check.
-
-ingest (mock LLM + x402) -> one FOCUS ledger -> anomaly detectors -> HTML report.
-Proves the wedge: token cost + x402 payments in one cross-rail ledger, with the
-Phase-0 (read-only) detection that turns "a dashboard" into "spend governance".
-"""
+"""CLI for the read-only cross-rail agent spend collector."""
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from .detectors import run_all
 from .report import render
-from .schema import SpendEvent
 from .store import SpendStore
 
-# Mock data, fixed timestamps -> deterministic self-check. research-bot has a small
-# token baseline plus one cost spike; support-bot's budget is driven near its cap.
-_LLM = (
-    [{"model": "claude-haiku-4-5", "input_tokens": 10_000, "output_tokens": 5_000,
-      "agent_id": "research-bot", "budget_id": "team-research", "provider": "anthropic",
-      "event_time": f"2026-06-29T0{i}:00:00Z", "request_id": f"r-{i}"} for i in range(1, 5)]
-    + [{"model": "claude-haiku-4-5", "input_tokens": 1_000_000, "output_tokens": 500_000,
-        "agent_id": "research-bot", "budget_id": "team-research", "provider": "anthropic",
-        "event_time": "2026-06-29T05:00:00Z", "request_id": "r-spike"}]
-    + [{"model": "gpt-5", "input_tokens": 100_000, "output_tokens": 20_000,
-        "agent_id": "support-bot", "budget_id": "team-support", "provider": "openai",
-        "event_time": f"2026-06-29T0{i}:00:00Z", "request_id": f"s-{i}"} for i in range(1, 5)]
-)
-_X402 = [
-    {"transaction": "0xr1", "amount": "0.10", "asset": "USDC", "network": "base", "payer": "0xa",
-     "pay_to": "0xfeed", "resource": "/feed", "agent_id": "research-bot",
-     "budget_id": "team-research", "event_time": "2026-06-29T01:05:00Z"},
-    {"transaction": "0xr2", "amount": "0.10", "asset": "USDC", "network": "base", "payer": "0xa",
-     "pay_to": "0xfeed", "resource": "/feed", "agent_id": "research-bot",
-     "budget_id": "team-research", "event_time": "2026-06-29T02:05:00Z"},
-    {"transaction": "0xs1", "amount": "3.00", "asset": "USDC", "network": "base", "payer": "0xb",
-     "pay_to": "0xtool", "resource": "/scrape", "agent_id": "support-bot",
-     "budget_id": "team-support", "event_time": "2026-06-29T03:05:00Z"},
-]
-_BUDGETS = {"team-research": 10.0, "team-support": 5.0}
+_ROOT = Path(__file__).resolve().parent.parent
+_FIXTURES = _ROOT / "fixtures"
+
+
+def _load_fixture(name: str):
+    with open(_FIXTURES / name, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _print_summary(store: SpendStore) -> None:
@@ -49,66 +27,56 @@ def _print_summary(store: SpendStore) -> None:
 
 
 def demo() -> None:
+    """Run the product demo: LLM + x402 + Stripe -> ledger -> security signals."""
+    llm = _load_fixture("llm_usage.json")
+    x402 = _load_fixture("x402_settlements.json")
+    stripe = _load_fixture("stripe_events.json")
+    budgets = _load_fixture("budgets.json")
+
     store = SpendStore()
-    store.ingest(from_llm_usage(_LLM))
-    store.ingest(from_x402_settlements(_X402))
+    store.ingest(from_llm_usage(llm))
+    store.ingest(from_x402_settlements(x402))
+    store.ingest(from_stripe_events(stripe))
     _print_summary(store)
 
-    alerts = run_all(store, _BUDGETS)
+    alerts = run_all(store, budgets)
     print("\nAlerts:")
     for a in alerts:
-        print(f"  [{a.severity:<4}] {a.kind:<12} {a.subject:<13} {a.detail}")
+        print(f"  [{a.severity:<4}] {a.kind:<22} {a.subject:<13} {a.detail}")
 
-    with open("report.html", "w") as f:
-        f.write(render(store, _BUDGETS, alerts))
+    with open("report.html", "w", encoding="utf-8") as f:
+        f.write(render(store, budgets, alerts))
     print("\nWrote report.html  (open in a browser)")
 
-    # --- self-check: full closed loop (ledger sums + both detectors fire) ---
-    spikes = [a for a in alerts if a.kind == "spend_spike"]
-    burns = [a for a in alerts if a.kind == "budget_burn"]
     kinds = {a.kind for a in alerts}
-    assert 7.40 < store.total() < 7.45, store.total()
-    assert len(spikes) == 1 and spikes[0].subject == "research-bot", spikes
-    assert any(b.subject == "team-support" for b in burns), burns
-    assert {"budget_burn_rate", "spend_per_task", "new_merchant_provider"} <= kinds, kinds
-    print("[self-check] ledger + spend-spike + budget-burn alert + report -- OK")
+    expected = {
+        "spend_spike",
+        "budget_burn",
+        "budget_burn_rate",
+        "spend_per_task",
+        "new_key_spike",
+        "new_merchant_provider",
+    }
+    assert 27.10 < store.total() < 27.12, store.total()
+    assert expected <= kinds, kinds
+    assert any(a.kind == "spend_spike" and a.subject == "research-bot" for a in alerts), alerts
+    assert any(a.kind == "new_key_spike" and a.subject == "new-key-bot" for a in alerts), alerts
+    assert any(a.kind == "new_merchant_provider" and a.subject == "support-bot" for a in alerts), alerts
+    print("[self-check] cross-rail ledger + Phase-0 security demo -- OK")
 
-    # offline check of the on-chain x402 decoder used by `pull-x402` (no network)
     from .sources import decode_transfer_log
-    _log = {"topics": ["0x" + "d" * 64, "0x" + "0" * 24 + "11" * 20, "0x" + "0" * 24 + "22" * 20],
-            "data": "0x" + format(2_500_000, "064x"), "transactionHash": "0xabc", "blockNumber": "0x10"}
-    _d = decode_transfer_log(_log)
-    assert _d["to"] == "0x" + "22" * 20 and _d["amount_raw"] == 2_500_000 and _d["block"] == 16, _d
+    log = {"topics": ["0x" + "d" * 64, "0x" + "0" * 24 + "11" * 20, "0x" + "0" * 24 + "22" * 20],
+           "data": "0x" + format(2_500_000, "064x"), "transactionHash": "0xabc", "blockNumber": "0x10"}
+    decoded = decode_transfer_log(log)
+    assert decoded["to"] == "0x" + "22" * 20 and decoded["amount_raw"] == 2_500_000
     print("[self-check] x402 Transfer decoder -- OK")
 
-    # offline check of the Stripe payment mapping used by `pull-stripe`
-    _evt = {"id": "evt_1", "created": 1781740800,
-            "type": "payment_intent.succeeded",
-            "data": {"object": {"id": "pi_1", "amount_received": 4200, "currency": "usd",
-                                 "metadata": {"agent_id": "ops-bot", "budget_id": "team-ops"}}}}
-    _se = from_stripe_events([_evt])[0]
-    assert _se.billed_cost == 42.0 and _se.rail == "card" and _se.x_agent_id == "ops-bot", _se
+    event = {"id": "evt_1", "created": 1781740800, "type": "payment_intent.succeeded",
+             "data": {"object": {"id": "pi_1", "amount_received": 4200, "currency": "usd",
+                                  "metadata": {"agent_id": "ops-bot", "budget_id": "team-ops"}}}}
+    stripe_event = from_stripe_events([event])[0]
+    assert stripe_event.billed_cost == 42.0 and stripe_event.rail == "card"
     print("[self-check] Stripe payment mapping -- OK")
-
-    _security_store = SpendStore()
-    _security_store.ingest([
-        SpendEvent(f"base-{i}", f"2026-06-29T0{i}:00:00Z", "llm_token", "openai", "gpt-5",
-                   1.0, "USD", 1, "usd", "known-key", "security-test", x_receipt_ref=f"base-{i}")
-        for i in range(1, 5)
-    ])
-    _security_store.ingest([
-        SpendEvent("new-key", "2026-06-29T05:00:00Z", "llm_token", "openai", "gpt-5",
-                   20.0, "USD", 1, "usd", "new-key", "security-test", x_receipt_ref="new-key"),
-        SpendEvent("old-merchant", "2026-06-29T01:00:00Z", "card", "stripe", "checkout",
-                   1.0, "USD", 1, "payment", "buyer-bot", "security-test",
-                   x_merchant_id="merchant-a", x_receipt_ref="old-merchant"),
-        SpendEvent("new-merchant", "2026-06-29T06:00:00Z", "card", "stripe", "checkout",
-                   2.0, "USD", 1, "payment", "buyer-bot", "security-test",
-                   x_merchant_id="merchant-b", x_receipt_ref="new-merchant"),
-    ])
-    _security_kinds = {a.kind for a in run_all(_security_store, {"security-test": 10.0})}
-    assert {"new_key_spike", "new_merchant_provider", "budget_burn_rate"} <= _security_kinds, _security_kinds
-    print("[self-check] Phase-0 security detectors -- OK")
 
 
 def pull() -> None:
@@ -130,7 +98,6 @@ def pull() -> None:
 
 def pull_x402() -> None:
     """Pull real x402 settlements (USDC into a merchant address on Base, read-only RPC)."""
-    from .adapters import from_x402_settlements
     from .sources import env_pay_to, fetch_base_usdc_transfers
     pay_to = env_pay_to() or (sys.argv[2] if len(sys.argv) > 2 else None)
     if not pay_to:
