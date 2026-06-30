@@ -17,7 +17,7 @@ from pathlib import Path
 from spend_collector.__main__ import _alert_row, _load_budgets, _run_summary, main, make_gateway_server
 from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
-from spend_collector.gateway import GuardRequest, decide
+from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
 from spend_collector.report import render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
@@ -843,6 +843,25 @@ class CollectorTest(unittest.TestCase):
         self.assertAlmostEqual(_price("gpt-4o-2024-08-06", 1_000_000, 0), 2.5)   # dated -> prefix
         self.assertAlmostEqual(_price("gpt-4o-mini-2024-07-18", 1_000_000, 0), 0.15)  # longest wins
         self.assertEqual(_price("totally-unknown", 1_000_000, 1_000_000), 0.0)   # unknown -> 0
+
+    def test_gateway_records_forwarded_spend(self) -> None:
+        raw = json.dumps({
+            "id": "chatcmpl-1", "model": "gpt-4o-2024-08-06",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+        }).encode()
+        provider = {"provider": "openai"}
+        guard_payload = {"agent": "advisor-bot", "budget": "team-edu", "session": "s1"}
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, provider, guard_payload)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.x_agent_id, "advisor-bot")
+        self.assertEqual(event.rail, "llm_token")
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertGreater(event.billed_cost, 0)  # dated id -> longest-prefix price match
+        self.assertEqual(store.total(), event.billed_cost)
+        # streamed body with no usage records nothing
+        self.assertIsNone(record_forwarded_spend(store, b"data: [DONE]\n", provider, guard_payload))
 
 
 if __name__ == "__main__":
