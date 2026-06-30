@@ -11,6 +11,7 @@
     "card": 10.0
   },
   "warn_new_merchants": true,
+  "gateway_tokens": ["dev-gateway-token"],
   "agents": {
     "research-bot": {
       "budgets": ["team-research"],
@@ -20,6 +21,18 @@
     "support-bot": {
       "budgets": ["team-support"],
       "rails": ["llm_token", "api_x402", "card"]
+    }
+  },
+  "providers": {
+    "openai": {
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY",
+      "rail": "llm_token",
+      "provider": "openai",
+      "merchant": "openai",
+      "service_from_body": "model",
+      "amount": 0.25,
+      "budget": "team-research"
     }
   },
   "targets": {

@@ -143,6 +143,26 @@ body to the configured URL. If denied, it does not call the target and returns a
 JSON decision such as `{"decision":"deny","allowed":false,"reasons":[...]}`.
 It never returns prompts, rewrites prompts, or injects model instructions.
 
+For SDKs that support a custom base URL, put the real provider key only on the
+gateway and give the agent a gateway token:
+
+```bash
+export OPENAI_API_KEY=sk-real-provider-key
+export SPEND_GATEWAY_TOKEN=dev-gateway-token
+python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
+```
+
+Then point the agent's OpenAI-compatible SDK at the gateway:
+
+```text
+base_url = http://127.0.0.1:8787/openai/v1
+api_key = dev-gateway-token
+headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
+```
+
+The gateway checks policy, replaces the gateway token with `OPENAI_API_KEY`, and
+forwards the original request to OpenAI only when allowed.
+
 This is the first inline-control layer: it does not move funds, but callers can
 block the spend when the decision is `deny`.
 

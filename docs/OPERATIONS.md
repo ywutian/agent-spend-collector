@@ -85,6 +85,27 @@ The gateway checks policy and ledger history only. It is the enforcement point
 when your agent, LLM proxy, or x402 middleware honors the decision.
 It does not return prompts, rewrite prompts, or inject model instructions.
 
+For provider-compatible SDKs, keep the real provider key in the gateway process
+and give agents only a gateway token:
+
+```bash
+export OPENAI_API_KEY=sk-real-provider-key
+export SPEND_GATEWAY_TOKEN=dev-gateway-token
+python3 -m spend_collector gateway --db spend.db --policy gateway.example.json
+```
+
+Then configure the agent SDK with:
+
+```text
+base_url = http://127.0.0.1:8787/openai/v1
+api_key = dev-gateway-token
+X-Agent-ID = research-bot
+X-Budget-ID = team-research
+```
+
+The gateway swaps the gateway token for the provider key only after an allow
+decision. If the policy denies the call, the provider is never contacted.
+
 ## Failure Handling
 
 Live HTTP/RPC pulls use bounded timeouts and retries. If a pull fails, rerun it:

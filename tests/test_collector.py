@@ -323,6 +323,122 @@ class CollectorTest(unittest.TestCase):
             self.assertNotIn("prompt", json.dumps(payload).lower())
             self.assertEqual(calls, [{"q": "yes"}])
 
+    def test_provider_compatible_gateway_swaps_agent_token_for_provider_key(self) -> None:
+        calls: list[dict] = []
+
+        class Provider(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                calls.append({
+                    "path": self.path,
+                    "auth": self.headers.get("authorization"),
+                    "agent": self.headers.get("x-agent-id"),
+                    "body": json.loads(body),
+                })
+                out = b'{"id":"chatcmpl_test","choices":[]}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, fmt, *args):
+                return
+
+        provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+        provider_thread.start()
+        self.addCleanup(lambda: (provider.shutdown(), provider_thread.join(1), provider.server_close()))
+
+        old_key = os.environ.get("FAKE_OPENAI_KEY")
+        os.environ["FAKE_OPENAI_KEY"] = "sk-provider-secret"
+        if old_key is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_OPENAI_KEY", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_OPENAI_KEY", old_key))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            policy = {
+                "max_amount": 1.0,
+                "gateway_tokens": ["agent-gateway-token"],
+                "providers": {
+                    "openai": {
+                        "base_url": f"http://127.0.0.1:{provider.server_port}",
+                        "api_key_env": "FAKE_OPENAI_KEY",
+                        "rail": "llm_token",
+                        "provider": "openai",
+                        "merchant": "openai",
+                        "service_from_body": "model",
+                        "amount": 0.5,
+                        "budget": "team-research",
+                    },
+                    "openai_blocked": {
+                        "base_url": f"http://127.0.0.1:{provider.server_port}",
+                        "api_key_env": "FAKE_OPENAI_KEY",
+                        "rail": "llm_token",
+                        "provider": "openai",
+                        "merchant": "openai",
+                        "service_from_body": "model",
+                        "amount": 2.5,
+                        "budget": "team-research",
+                    },
+                },
+            }
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump(policy, f)
+
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (
+                gateway_server.shutdown(),
+                gateway_thread.join(1),
+                gateway_server.server_close(),
+            ))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            body = {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}
+            allow_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/openai/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": "Bearer agent-gateway-token",
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(allow_req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(json.load(resp)["id"], "chatcmpl_test")
+
+            self.assertEqual(calls[0]["path"], "/v1/chat/completions")
+            self.assertEqual(calls[0]["auth"], "Bearer sk-provider-secret")
+            self.assertEqual(calls[0]["agent"], None)
+            self.assertEqual(calls[0]["body"], body)
+
+            deny_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/openai_blocked/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": "Bearer agent-gateway-token",
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(deny_req, timeout=2)
+            self.assertEqual(err.exception.code, 403)
+            payload = json.loads(err.exception.read())
+            self.assertEqual(payload["decision"], "deny")
+            self.assertEqual(len(calls), 1)
+
     def test_store_migrates_existing_ledgers_to_current_schema(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             path = f.name

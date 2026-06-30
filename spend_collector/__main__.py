@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -259,10 +260,23 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("content-length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
+            self._raw_body = self.rfile.read(length)
+            payload = json.loads(self._raw_body or b"{}")
             if not isinstance(payload, dict):
                 raise ValueError("request body must be a JSON object")
             return payload
+
+        def _authorized(self, policy: dict) -> bool:
+            tokens = policy.get("gateway_tokens")
+            env_token = os.environ.get("SPEND_GATEWAY_TOKEN")
+            if env_token:
+                tokens = list(tokens or []) + [env_token]
+            if not tokens:
+                return True
+            auth = self.headers.get("authorization", "")
+            bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+            supplied = bearer or self.headers.get("x-gateway-token", "")
+            return supplied in set(str(t) for t in tokens)
 
         def _guard_payload(self, payload: dict) -> dict:
             req = GuardRequest(
@@ -319,6 +333,73 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
+        def _provider_route(self, policy: dict) -> tuple[str, dict, str] | None:
+            parsed = urllib.parse.urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/", 1)
+            if not parts or not parts[0]:
+                return None
+            provider_id = parts[0]
+            provider = policy.get("providers", {}).get(provider_id)
+            if not isinstance(provider, dict):
+                return None
+            suffix = "/" + parts[1] if len(parts) > 1 else "/"
+            if parsed.query:
+                suffix += "?" + parsed.query
+            return provider_id, provider, suffix
+
+        def _provider_guard_payload(self, provider_id: str, provider: dict,
+                                    suffix: str, payload: dict) -> dict:
+            service_key = provider.get("service_from_body")
+            service = payload.get(service_key) if service_key else None
+            agent = self.headers.get("x-agent-id") or provider.get("agent")
+            budget = self.headers.get("x-budget-id") or provider.get("budget", "default")
+            if not agent:
+                raise ValueError("provider-compatible calls require X-Agent-ID or provider.agent")
+            return {
+                "agent": agent,
+                "rail": provider.get("rail", "llm_token"),
+                "amount": provider.get("amount", provider.get("max_estimated_amount", 0)),
+                "budget": budget,
+                "provider": provider.get("provider", provider_id),
+                "service": service or provider.get("service", suffix),
+                "merchant": provider.get("merchant", provider_id),
+                "session": self.headers.get("x-session-id", ""),
+            }
+
+        def _provider_headers(self, provider: dict) -> dict[str, str]:
+            headers = {
+                str(k): str(v)
+                for k, v in self.headers.items()
+                if k.lower() not in {
+                    "host", "content-length", "connection", "authorization",
+                    "x-agent-id", "x-budget-id", "x-session-id", "x-gateway-token",
+                }
+            }
+            provider_key = provider.get("api_key")
+            if provider.get("api_key_env"):
+                provider_key = os.environ.get(str(provider["api_key_env"]))
+            if not provider_key:
+                raise ValueError("provider API key is not configured")
+            auth_header = str(provider.get("auth_header", "Authorization"))
+            auth_prefix = str(provider.get("auth_prefix", "Bearer"))
+            headers[auth_header] = f"{auth_prefix} {provider_key}".strip()
+            return headers
+
+        def _forward_provider(self, provider: dict, suffix: str) -> None:
+            url = str(provider["base_url"]).rstrip("/") + suffix
+            method = str(provider.get("method", "POST")).upper()
+            req = urllib.request.Request(
+                url,
+                data=getattr(self, "_raw_body", b""),
+                headers=self._provider_headers(provider),
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=float(provider.get("timeout", 30))) as resp:
+                    self._send_bytes(resp.status, resp.read(), dict(resp.headers.items()))
+            except urllib.error.HTTPError as exc:
+                self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
+
         def do_GET(self) -> None:
             if self.path == "/health":
                 self._send(200, {"ok": True})
@@ -328,18 +409,31 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
         def do_POST(self) -> None:
             try:
                 payload = self._read_json()
+                policy = _load_policy(policy_path)
+                if not self._authorized(policy):
+                    self._send(401, {"error": "unauthorized"})
+                    return
                 if self.path == "/guard":
                     decision = self._guard_payload(payload)
                     self._send(200 if decision["allowed"] else 403, decision)
                     return
                 if self.path == "/forward":
-                    policy = _load_policy(policy_path)
                     target, guard_payload = self._target_request(payload, policy)
                     decision = self._guard_payload(guard_payload)
                     if not decision["allowed"]:
                         self._send(403, decision)
                         return
                     self._forward(target, payload)
+                    return
+                provider_route = self._provider_route(policy)
+                if provider_route:
+                    provider_id, provider, suffix = provider_route
+                    guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
+                    decision = self._guard_payload(guard_payload)
+                    if not decision["allowed"]:
+                        self._send(403, decision)
+                        return
+                    self._forward_provider(provider, suffix)
                     return
                 self._send(404, {"error": "not found"})
             except urllib.error.URLError as exc:
