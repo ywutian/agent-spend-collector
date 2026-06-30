@@ -198,6 +198,9 @@ def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
         print(f"ledger not found: {db_path}")
         sys.exit(1)
     with SpendStore(str(db_path)) as store:
+        if store.total() == 0:
+            print(f"{db_path} is empty -- run a pull first (pull / pull-x402 / pull-stripe).")
+            sys.exit(1)
         print(f"loaded ledger {db_path}")
         _finish_run(store, _load_budgets(), out_dir)
 

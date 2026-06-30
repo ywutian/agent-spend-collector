@@ -143,6 +143,10 @@ For production scheduling, artifact retention, and incident handling, see
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md). A safe starting config is provided in
 `.env.example` and `budgets.example.json`.
 
+Or do it all at once: **`scripts/dogfood.sh`** pulls whatever credentials are set
+and opens the dashboard. After any pull, `python3 -m spend_collector report --db
+spend.db --out-dir artifacts` re-renders the evidence page.
+
 Attribution:
 
 - LLM: one API key per agent.
