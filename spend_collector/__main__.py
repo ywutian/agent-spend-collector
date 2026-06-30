@@ -70,6 +70,14 @@ def demo() -> None:
     assert any(b.subject == "team-support" for b in burns), burns
     print("[self-check] ledger + spend-spike + budget-burn alert + report -- OK")
 
+    # offline check of the on-chain x402 decoder used by `pull-x402` (no network)
+    from .sources import decode_transfer_log
+    _log = {"topics": ["0x" + "d" * 64, "0x" + "0" * 24 + "11" * 20, "0x" + "0" * 24 + "22" * 20],
+            "data": "0x" + format(2_500_000, "064x"), "transactionHash": "0xabc", "blockNumber": "0x10"}
+    _d = decode_transfer_log(_log)
+    assert _d["to"] == "0x" + "22" * 20 and _d["amount_raw"] == 2_500_000 and _d["block"] == 16, _d
+    print("[self-check] x402 Transfer decoder -- OK")
+
 
 def pull() -> None:
     """Pull real cost data from the Anthropic Cost API (read-only, admin key)."""
@@ -88,14 +96,34 @@ def pull() -> None:
         print(f"  [{a.severity}] {a.kind} {a.subject} {a.detail}")
 
 
+def pull_x402() -> None:
+    """Pull real x402 settlements (USDC into a merchant address on Base, read-only RPC)."""
+    from .adapters import from_x402_settlements
+    from .sources import env_pay_to, fetch_base_usdc_transfers
+    pay_to = env_pay_to() or (sys.argv[2] if len(sys.argv) > 2 else None)
+    if not pay_to:
+        print("Pass an x402 receiving address (Base USDC):\n"
+              "  X402_PAY_TO=0x... python3 -m spend_collector pull-x402\n"
+              "  python3 -m spend_collector pull-x402 0x...")
+        sys.exit(1)
+    store = SpendStore("spend.db")
+    n = store.ingest(from_x402_settlements(fetch_base_usdc_transfers(pay_to)))
+    print(f"ingested {n} x402 settlements -> spend.db")
+    _print_summary(store)
+    for a in run_all(store, {}):
+        print(f"  [{a.severity}] {a.kind} {a.subject} {a.detail}")
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "demo"
     if cmd == "demo":
         demo()
     elif cmd == "pull":
         pull()
+    elif cmd == "pull-x402":
+        pull_x402()
     else:
-        print("usage: python3 -m spend_collector [demo|pull]")
+        print("usage: python3 -m spend_collector [demo|pull|pull-x402]")
         sys.exit(1)
 
 

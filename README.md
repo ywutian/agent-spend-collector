@@ -25,13 +25,16 @@ and self-checks. Open `report.html` in a browser.
 ## Real data (read-only)
 
 ```bash
-export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...     # admin/usage key, read-only
+# LLM token cost (admin/usage key, read-only)
+export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
 python3 -m spend_collector pull
+
+# x402 payments — USDC settlements into your merchant address on Base (no key, public RPC)
+python3 -m spend_collector pull-x402 0xYourReceivingAddress
 ```
 
-Pulls your Anthropic cost report (per-API-key = per-agent attribution) into `spend.db`
-and runs the detectors. OpenAI / OpenRouter follow the same shape; x402 ingests from
-facilitator receipts or Dune/Allium.
+Both write to `spend.db` and run the detectors. LLM attribution = one API key per agent;
+x402 attribution = payer wallet. OpenAI / OpenRouter follow the Anthropic shape.
 
 ## What's inside
 
@@ -55,8 +58,9 @@ backstop is on-chain caps (ERC-7715 / Coinbase Spend Permissions). That's the
 
 1. ✅ Closed loop on mock data (ingest → ledger → detect → report).
 2. ✅ Real Anthropic cost pull (`pull`).
-3. Real x402 pull (Dune/Allium) + Stripe Events rail → true cross-rail.
-4. Grafana/Metabase on the DB; richer detectors (multi-window burn-rate, LLMjacking signals).
-5. Inline enforcement (gateway/middleware) — Phase 1.
+3. ✅ Real x402 pull — on-chain USDC on Base (`pull-x402`).
+4. Stripe Events rail → token + crypto + card in one ledger.
+5. Grafana/Metabase on the DB; richer detectors (multi-window burn-rate, LLMjacking signals).
+6. Inline enforcement (gateway/middleware) — Phase 1.
 
 Requires Python 3.10+. No dependencies. License: MIT.

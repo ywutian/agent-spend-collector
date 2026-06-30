@@ -1,18 +1,19 @@
-"""Live, read-only pulls from provider cost APIs -> SpendEvent rows.
+"""Live, read-only pulls from provider cost APIs and on-chain settlements -> SpendEvent rows.
 
-Today: Anthropic Cost & Usage API (admin key). OpenAI / OpenRouter follow the same
-shape (cost already in USD, grouped by api_key_id). Zero deps (stdlib urllib).
-Attribution works when each agent holds its own API key (one key = one agent).
+- LLM token: Anthropic Cost & Usage API (admin key). OpenAI / OpenRouter share the shape.
+- x402: USDC Transfer events into a merchant address on Base, via a public RPC (no key).
+Zero deps (stdlib urllib). Attribution works when each agent holds its own key/wallet.
 """
 from __future__ import annotations
 
 import json
 import os
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from .schema import SpendEvent
 
+# --- LLM token cost (Anthropic) ---
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/organizations/cost_report"
 
 
@@ -73,3 +74,72 @@ def from_llm_cost_rows(rows, key_to_agent=None, key_to_budget=None) -> list[Spen
             x_receipt_ref=key,
         ))
     return out
+
+
+# --- x402 / on-chain USDC settlements (Base), read-only via public RPC ---
+BASE_RPC = "https://mainnet.base.org"
+USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def env_pay_to() -> str | None:
+    return os.environ.get("X402_PAY_TO")
+
+
+def _rpc(method: str, params: list, rpc_url: str) -> object:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(rpc_url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        out = json.load(resp)
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return out["result"]
+
+
+def decode_transfer_log(log: dict) -> dict:
+    """Decode an ERC-20 Transfer log -> {from, to, amount_raw, tx, block}.
+
+    Pure function (no network) so the non-trivial hex decoding is unit-checkable
+    offline. ERC-20 Transfer(address indexed from, address indexed to, uint256 value):
+    from/to are in indexed topics[1]/[2] (last 20 bytes), value is the data word.
+    """
+    topics = log["topics"]
+    return {
+        "from": "0x" + topics[1][-40:],
+        "to": "0x" + topics[2][-40:],
+        "amount_raw": int(log["data"], 16),
+        "tx": log["transactionHash"],
+        "block": int(log["blockNumber"], 16),
+    }
+
+
+def fetch_base_usdc_transfers(pay_to: str, *, rpc_url: str = BASE_RPC, usdc: str = USDC_BASE,
+                              lookback_blocks: int = 2000, decimals: int = 6) -> list[dict]:
+    """Read-only: USDC Transfer events INTO `pay_to` on Base (the x402 settlement
+    leg), returned as x402 receipt rows ready for adapters.from_x402_settlements.
+    No API key — a public RPC. ponytail: single getLogs window; page the block
+    range when you need more than `lookback_blocks` of history.
+    """
+    latest = int(_rpc("eth_blockNumber", [], rpc_url), 16)
+    from_block = max(0, latest - lookback_blocks)
+    pad_to = "0x" + "0" * 24 + pay_to.lower().replace("0x", "")
+    logs = _rpc("eth_getLogs", [{
+        "address": usdc, "fromBlock": hex(from_block), "toBlock": "latest",
+        "topics": [_TRANSFER_TOPIC, None, pad_to],
+    }], rpc_url)
+
+    ts_cache: dict[int, str] = {}
+    rows = []
+    for log in logs:
+        d = decode_transfer_log(log)
+        if d["block"] not in ts_cache:
+            blk = _rpc("eth_getBlockByNumber", [hex(d["block"]), False], rpc_url)
+            ts_cache[d["block"]] = datetime.fromtimestamp(
+                int(blk["timestamp"], 16), tz=timezone.utc).isoformat()
+        rows.append({
+            "transaction": d["tx"], "amount": f"{d['amount_raw'] / 10 ** decimals:.6f}",
+            "asset": "USDC", "network": "base", "payer": d["from"], "pay_to": d["to"],
+            "resource": "onchain:transfer", "event_time": ts_cache[d["block"]],
+            "agent_id": d["from"], "budget_id": "default",
+        })
+    return rows
