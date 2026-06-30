@@ -97,7 +97,7 @@ def _pretty_kind(kind: str) -> str:
 def _event_rows(store: SpendStore, limit: int = 12) -> list:
     return store.db.execute(
         "SELECT event_time, x_agent_id, rail, provider_name, service_name, billed_cost, "
-        "billing_currency, x_budget_id, x_receipt_ref "
+        "billing_currency, x_budget_id, x_receipt_ref, x_source_event "
         "FROM spend_events ORDER BY event_time DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -207,14 +207,16 @@ def _section_agent_rail(store: SpendStore) -> str:
 
 def _section_events(store: SpendStore) -> str:
     p = ["<section class='panel'><h2>Recent Ledger Events</h2><table><tr>"
-         "<th>Time</th><th>Agent</th><th>Rail</th><th>Service</th><th class='num'>Cost</th></tr>"]
+         "<th>Time</th><th>Agent</th><th>Rail</th><th>Service</th><th>Evidence</th><th class='num'>Cost</th></tr>"]
     rows = _event_rows(store)
     if not rows:
-        p.append("<tr><td colspan='5'>No spend events yet.</td></tr>")
+        p.append("<tr><td colspan='6'>No spend events yet.</td></tr>")
     for r in rows:
+        evidence = r["x_source_event"][-12:] if r["x_source_event"] else ""
         p.append(
             f"<tr><td>{escape(r['event_time'])}</td><td>{escape(r['x_agent_id'])}</td>"
             f"<td>{escape(r['rail'])}</td><td>{escape(r['provider_name'])} / {escape(r['service_name'])}</td>"
+            f"<td>{escape(evidence)}</td>"
             f"<td class='num'>{_money(r['billed_cost'])} {escape(r['billing_currency'])}</td></tr>"
         )
     p.append("</table></section>")

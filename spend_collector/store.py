@@ -24,9 +24,29 @@ class SpendStore:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute(_DDL)
+        self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        existing = {row["name"] for row in self.db.execute("PRAGMA table_info(spend_events)")}
+        for column in COLUMNS:
+            if column not in existing:
+                kind = "REAL" if column in _NUMERIC else "TEXT"
+                default = "0" if column in _NUMERIC else "''"
+                self.db.execute(f"ALTER TABLE spend_events ADD COLUMN {column} {kind} DEFAULT {default}")
+        self.db.commit()
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self) -> "SpendStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def ingest(self, events: Iterable[SpendEvent]) -> int:
         rows = [tuple(e.as_row()[c] for c in COLUMNS) for e in events]
+        before = self.db.total_changes
         # INSERT OR IGNORE => idempotent on event_id (re-ingest never double-counts).
         self.db.executemany(
             f"INSERT OR IGNORE INTO spend_events ({', '.join(COLUMNS)}) "
@@ -34,7 +54,7 @@ class SpendStore:
             rows,
         )
         self.db.commit()
-        return len(rows)
+        return self.db.total_changes - before
 
     def total(self) -> float:
         return self.db.execute("SELECT COALESCE(SUM(billed_cost), 0) FROM spend_events").fetchone()[0]

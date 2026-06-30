@@ -6,6 +6,8 @@ See docs/mvp-spend-ledger.md for the full design.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass, fields
 
 RAILS = ("llm_token", "api_x402", "card", "stablecoin")
@@ -30,10 +32,17 @@ class SpendEvent:
     x_session_id: str = ""
     x_merchant_id: str = ""
     x_receipt_ref: str = ""   # tx hash | request id | span id
+    x_source_event: str = ""   # sha256/source hash of raw provider event
     charge_category: str = "Usage"  # FOCUS: Usage | Purchase | Tax
 
     def as_row(self) -> dict:
         return asdict(self)
+
+
+def source_ref(provider: str, payload: dict) -> str:
+    """Stable source-event evidence pointer for raw provider payloads."""
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return f"{provider}:sha256:{hashlib.sha256(body).hexdigest()}"
 
 
 COLUMNS = [f.name for f in fields(SpendEvent)]

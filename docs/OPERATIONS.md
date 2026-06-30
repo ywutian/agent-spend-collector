@@ -1,0 +1,100 @@
+# Operations
+
+`agent-spend-collector` is a read-only observer. It should run with restricted
+provider credentials, persist `spend.db`, and generate `report.html` after every
+pull.
+
+## Local Production Run
+
+1. Copy `.env.example` into your secret manager or shell profile.
+2. Create a budget cap file:
+
+   ```json
+   {
+     "team-research": 10.0,
+     "team-support": 8.0,
+     "default": 100.0
+   }
+   ```
+
+3. Run each configured rail on a schedule:
+
+   ```bash
+   export SPEND_BUDGETS_FILE=budgets.json
+   python3 -m spend_collector pull --db spend.db --days 7 --out-dir artifacts
+   python3 -m spend_collector pull-stripe --db spend.db --days 7 --out-dir artifacts
+   python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --db spend.db --out-dir artifacts
+   ```
+
+4. Publish or archive these local artifacts:
+
+   - `spend.db`
+   - `artifacts/report.html`
+   - `artifacts/alerts.json`
+   - `artifacts/run-summary.json`
+   - command logs
+   - raw provider receipts in your own secure archive
+
+## Scheduling
+
+Use cron, systemd timers, GitHub Actions with secrets, or any job runner that can
+persist `spend.db` between runs. Stripe Events have limited retention, so poll
+frequently and keep the SQLite ledger as the durable history.
+
+## Safety Boundaries
+
+- Use restricted/read-only keys when providers support them.
+- Do not store private keys, card data, PAN/CVV, or wallet seed material.
+- The collector does not move funds and does not enforce policy.
+- Treat alerts as evidence for investigation or for future inline enforcement.
+- `report.html` shows a short evidence suffix, not the raw source payload.
+
+## Failure Handling
+
+Live HTTP/RPC pulls use bounded timeouts and retries. If a pull fails, rerun it:
+the ledger is idempotent on `event_id`, so repeated events are ignored and will
+not double-count.
+
+## Evidence Model
+
+Every ledger row has two audit pointers:
+
+- `x_receipt_ref`: provider-native reference, such as request id, transaction
+  hash, PaymentIntent id, or API key id.
+- `x_source_event`: `provider:sha256:<hash>` of the raw source payload before it
+  was normalized into the ledger.
+
+The dashboard only displays the final hash suffix so it is safe to share as an
+evidence page. Keep raw provider receipts in your own secure archive if you need
+full forensic replay.
+
+## Incident Checklist
+
+When `report.html` shows high severity alerts:
+
+1. Identify the agent, rail, merchant/provider, and receipt reference.
+2. Check whether the spend was approved by the expected budget owner.
+3. Rotate or revoke the implicated provider key/wallet permission if compromise
+   is plausible.
+4. Preserve `spend.db`, `report.html`, `alerts.json`, `run-summary.json`, and
+   raw provider receipts for audit.
+
+## Machine-Readable Outputs
+
+`alerts.json` is a list of alert objects:
+
+```json
+[
+  {
+    "kind": "new_key_spike",
+    "subject": "new-key-bot",
+    "severity": "high",
+    "detail": "first llm_token charge ...",
+    "value": 15.0
+  }
+]
+```
+
+`run-summary.json` is intended for job runners and alert routing. It contains
+total spend, event count, distinct agents, rails, configured budgets, and counts
+of high/warn alerts. A cron wrapper can page when `alerts.high > 0`.

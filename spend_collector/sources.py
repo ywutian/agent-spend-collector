@@ -8,11 +8,43 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
-from .schema import SpendEvent
+from .schema import SpendEvent, source_ref
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _request_json(req: urllib.request.Request, *, timeout: int | None = None,
+                  retries: int | None = None) -> object:
+    timeout = timeout if timeout is not None else _env_int("SPEND_HTTP_TIMEOUT", 30)
+    retries = retries if retries is not None else _env_int("SPEND_HTTP_RETRIES", 3)
+    last_error: BaseException | None = None
+
+    for attempt in range(max(1, retries)):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504} or attempt == retries - 1:
+                raise
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt == retries - 1:
+                raise
+        time.sleep(min(2 ** attempt, 8))
+
+    raise RuntimeError(f"request failed after {retries} attempts") from last_error
 
 # --- LLM token cost (Anthropic) ---
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -30,8 +62,7 @@ def fetch_anthropic_cost_report(admin_key: str, days: int = 7) -> list[dict]:
         "x-api-key": admin_key,
         "anthropic-version": "2023-06-01",
     })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.load(resp)
+    data = _request_json(req)
 
     rows: list[dict] = []
     for bucket in data.get("data", []):
@@ -66,6 +97,7 @@ def from_llm_cost_rows(rows, key_to_agent=None, key_to_budget=None) -> list[Spen
             x_agent_id=key_to_agent.get(key, key),
             x_budget_id=key_to_budget.get(key, "default"),
             x_receipt_ref=key,
+            x_source_event=source_ref("anthropic", r),
         ))
     return out
 
@@ -97,8 +129,7 @@ def fetch_stripe_payment_intent_events(secret_key: str, days: int = 7, limit: in
             params["starting_after"] = starting_after
         url = f"{_STRIPE_EVENTS_URL}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret_key}"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.load(resp)
+        data = _request_json(req)
         batch = data.get("data", [])
         rows.extend(batch)
         if not data.get("has_more") or not batch:
@@ -119,8 +150,7 @@ def env_pay_to() -> str | None:
 def _rpc(method: str, params: list, rpc_url: str) -> object:
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     req = urllib.request.Request(rpc_url, data=body, headers={"content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        out = json.load(resp)
+    out = _request_json(req)
     if out.get("error"):
         raise RuntimeError(out["error"])
     return out["result"]

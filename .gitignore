@@ -1,3 +1,9 @@
 __pycache__/
 *.db
 report.html
+alerts.json
+run-summary.json
+artifacts/
+artifacts-*/
+dist/
+*.egg-info/

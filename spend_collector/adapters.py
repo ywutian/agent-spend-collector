@@ -10,7 +10,7 @@ import base64
 import json
 from datetime import datetime, timezone
 
-from .schema import SpendEvent
+from .schema import SpendEvent, source_ref
 
 # ponytail: tiny static price book (USD per 1M tokens: input, output). Swap for
 # `tokencost` (MIT, 400+ models) when you need real/maintained pricing.
@@ -51,6 +51,7 @@ def from_llm_usage(records: list[dict]) -> list[SpendEvent]:
             x_budget_id=r["budget_id"],
             x_session_id=r.get("session_id", ""),
             x_receipt_ref=r.get("request_id", ""),
+            x_source_event=source_ref(r.get("provider", "llm"), r),
         ))
     return out
 
@@ -83,6 +84,7 @@ def from_x402_settlements(receipts: list[dict]) -> list[SpendEvent]:
             x_budget_id=r["budget_id"],
             x_merchant_id=r["pay_to"],
             x_receipt_ref=r["transaction"],
+            x_source_event=source_ref("x402", r),
             charge_category="Purchase",
         ))
     return out
@@ -140,6 +142,7 @@ def from_stripe_events(events: list[dict]) -> list[SpendEvent]:
             x_session_id=meta.get("session_id") or meta.get("x_session_id") or "",
             x_merchant_id=meta.get("merchant_id") or meta.get("x_merchant_id") or "stripe",
             x_receipt_ref=pi.get("id") or e["id"],
+            x_source_event=source_ref("stripe", e),
             charge_category="Purchase",
         ))
     return out
