@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from .adapters import from_llm_usage, from_x402_settlements
+from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from .detectors import run_all
 from .report import render
 from .store import SpendStore
@@ -79,11 +79,11 @@ def demo() -> None:
     print("[self-check] x402 Transfer decoder -- OK")
 
     # offline check of the Stripe payment mapping used by `pull-stripe`
-    from .sources import _stripe_row, from_stripe_payments
     _evt = {"id": "evt_1", "created": 1781740800,
+            "type": "payment_intent.succeeded",
             "data": {"object": {"id": "pi_1", "amount_received": 4200, "currency": "usd",
                                  "metadata": {"agent_id": "ops-bot", "budget_id": "team-ops"}}}}
-    _se = from_stripe_payments([_stripe_row(_evt)])[0]
+    _se = from_stripe_events([_evt])[0]
     assert _se.billed_cost == 42.0 and _se.rail == "card" and _se.x_agent_id == "ops-bot", _se
     print("[self-check] Stripe payment mapping -- OK")
 
@@ -125,15 +125,15 @@ def pull_x402() -> None:
 
 def pull_stripe() -> None:
     """Pull real card payments via the Stripe Events API (read-only, restricted key)."""
-    from .sources import env_stripe_key, fetch_stripe_payments, from_stripe_payments
+    from .sources import env_stripe_key, fetch_stripe_payment_intent_events
     key = env_stripe_key()
     if not key:
-        print("Set STRIPE_API_KEY (restricted read key) to pull card payments:\n"
-              "  export STRIPE_API_KEY=rk_live_...\n"
+        print("Set STRIPE_SECRET_KEY (restricted read key) to pull card payments:\n"
+              "  export STRIPE_SECRET_KEY=rk_live_...\n"
               "  python3 -m spend_collector pull-stripe")
         sys.exit(1)
     store = SpendStore("spend.db")
-    n = store.ingest(from_stripe_payments(fetch_stripe_payments(key)))
+    n = store.ingest(from_stripe_events(fetch_stripe_payment_intent_events(key)))
     print(f"ingested {n} Stripe payments -> spend.db")
     _print_summary(store)
     for a in run_all(store, {}):
