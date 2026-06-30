@@ -264,6 +264,7 @@ class CollectorTest(unittest.TestCase):
             db_path = Path(tmp) / "spend.db"
             policy = {
                 "max_amount": 1.0,
+                "gateway_tokens": ["test-gateway-token"],
                 "targets": {
                     "ok": {
                         "url": f"http://127.0.0.1:{upstream.server_port}/ok",
@@ -302,7 +303,7 @@ class CollectorTest(unittest.TestCase):
             allow_req = urllib.request.Request(
                 f"http://127.0.0.1:{gateway_port}/forward",
                 data=json.dumps({"agent": "research-bot", "target": "ok", "body": {"q": "yes"}}).encode(),
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", "authorization": "Bearer test-gateway-token"},
                 method="POST",
             )
             with urllib.request.urlopen(allow_req, timeout=2) as resp:
@@ -313,7 +314,7 @@ class CollectorTest(unittest.TestCase):
             deny_req = urllib.request.Request(
                 f"http://127.0.0.1:{gateway_port}/forward",
                 data=json.dumps({"agent": "research-bot", "target": "blocked", "body": {"q": "no"}}).encode(),
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", "authorization": "Bearer test-gateway-token"},
                 method="POST",
             )
             with self.assertRaises(urllib.error.HTTPError) as err:
@@ -440,6 +441,287 @@ class CollectorTest(unittest.TestCase):
             payload = json.loads(err.exception.read())
             self.assertEqual(payload["decision"], "deny")
             self.assertEqual(len(calls), 1)
+
+    def test_policy_validation_and_audit_config_are_secret_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = Path(tmp) / "valid.json"
+            typo = Path(tmp) / "typo.json"
+            raw = Path(tmp) / "raw.json"
+            no_token = Path(tmp) / "no-token.json"
+            with open(valid, "w", encoding="utf-8") as f:
+                json.dump({
+                    "gateway_tokens": ["agent-token"],
+                    "providers": {
+                        "openai": {
+                            "base_url": "https://api.openai.com",
+                            "api_key_env": "OPENAI_API_KEY",
+                            "amount": 0.1,
+                        },
+                    },
+                }, f)
+            with open(typo, "w", encoding="utf-8") as f:
+                json.dump({"max_amunt": 1}, f)
+            with open(raw, "w", encoding="utf-8") as f:
+                json.dump({
+                    "gateway_tokens": ["agent-token"],
+                    "providers": {"openai": {
+                        "base_url": "https://api.openai.com",
+                        "api_key": "sk-secret",
+                        "amount": 0.1,
+                    }},
+                }, f)
+            with open(no_token, "w", encoding="utf-8") as f:
+                json.dump({
+                    "providers": {"openai": {
+                        "base_url": "https://api.openai.com",
+                        "api_key_env": "OPENAI_API_KEY",
+                        "amount": 0.1,
+                    }},
+                }, f)
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                main(["validate-policy", "--policy", str(valid)])
+            self.assertIn("policy OK", out.getvalue())
+            for bad in (typo, raw, no_token):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        main(["validate-policy", "--policy", str(bad)])
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                main(["audit-config", "--policy", str(valid), "--db", "spend.db", "--out-dir", "artifacts"])
+            audit = json.loads(out.getvalue())
+            self.assertIn("OPENAI_API_KEY", audit["env_vars_read"])
+            self.assertIn("api.openai.com", audit["outbound_hosts"])
+            self.assertNotIn("sk-secret", json.dumps(audit))
+            self.assertIn("prompts", audit["will_not_store"])
+
+    def test_gateway_requires_token_for_forwarding_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "gateway_tokens": ["agent-token"],
+                    "providers": {
+                        "openai": {
+                            "base_url": "https://example.com",
+                            "api_key_env": "FAKE_OPENAI_KEY",
+                            "amount": 0.1,
+                        },
+                    },
+                }, f)
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), gateway_thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/openai/v1/chat/completions",
+                data=json.dumps({"model": "gpt-test"}).encode(),
+                headers={"content-type": "application/json", "x-agent-id": "research-bot"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(req, timeout=2)
+            self.assertEqual(err.exception.code, 401)
+
+    def test_gateway_audits_and_reserves_then_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"budgets": {"team-research": 1.0}, "reservation_ttl_seconds": 900}, f)
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                main([
+                    "guard", "--db", str(db_path), "--policy", str(policy_path),
+                    "--agent", "research-bot", "--rail", "api_x402", "--amount", "0.75",
+                    "--budget", "team-research", "--request-id", "req-a",
+                ])
+            first = json.loads(out.getvalue())
+            self.assertTrue(first["allowed"])
+            self.assertTrue(first["reservation_id"])
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                main([
+                    "guard", "--db", str(db_path), "--policy", str(policy_path),
+                    "--agent", "research-bot", "--rail", "api_x402", "--amount", "0.75",
+                    "--budget", "team-research", "--request-id", "req-b",
+                ])
+            second = json.loads(out.getvalue())
+            self.assertFalse(second["allowed"])
+
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                self.assertEqual(
+                    store.db.execute("SELECT COUNT(*) FROM gateway_decisions").fetchone()[0], 2
+                )
+                self.assertEqual(
+                    store.db.execute("SELECT COUNT(*) FROM spend_reservations WHERE status = 'active'").fetchone()[0], 1
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                main(["release-reservation", "--db", str(db_path), "--request-id", "req-a"])
+            self.assertEqual(json.loads(out.getvalue())["released"], 1)
+
+    def test_duplicate_request_id_does_not_double_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"budgets": {"team-research": 10.0}}, f)
+            argv = [
+                "guard", "--db", str(db_path), "--policy", str(policy_path),
+                "--agent", "research-bot", "--rail", "api_x402", "--amount", "1.00",
+                "--budget", "team-research", "--request-id", "same-req",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(argv)
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(argv)
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                self.assertEqual(
+                    store.db.execute("SELECT COUNT(*) FROM spend_reservations").fetchone()[0], 1
+                )
+                self.assertEqual(
+                    store.db.execute("SELECT COUNT(*) FROM gateway_decisions").fetchone()[0], 1
+                )
+
+    def test_concurrent_gateway_requests_cannot_over_reserve_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"budgets": {"team-research": 1.0}}, f)
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), gateway_thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            results: list[bool] = []
+            lock = threading.Lock()
+            start = threading.Barrier(3)
+
+            def call(idx: int) -> None:
+                start.wait()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{gateway_port}/guard",
+                    data=json.dumps({
+                        "agent": "research-bot",
+                        "rail": "api_x402",
+                        "amount": 0.75,
+                        "budget": "team-research",
+                        "request_id": f"parallel-{idx}",
+                    }).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        payload = json.load(resp)
+                except urllib.error.HTTPError as exc:
+                    payload = json.loads(exc.read())
+                with lock:
+                    results.append(payload["allowed"])
+
+            threads = [threading.Thread(target=call, args=(i,)) for i in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(3)
+
+            self.assertEqual(sorted(results), [False, True])
+
+    def test_provider_gateway_streams_sse_without_logging_body(self) -> None:
+        class StreamProvider(BaseHTTPRequestHandler):
+            def do_POST(self):
+                out = b"data: one\n\ndata: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, fmt, *args):
+                return
+
+        provider = ThreadingHTTPServer(("127.0.0.1", 0), StreamProvider)
+        provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+        provider_thread.start()
+        self.addCleanup(lambda: (provider.shutdown(), provider_thread.join(1), provider.server_close()))
+        old_key = os.environ.get("FAKE_STREAM_KEY")
+        os.environ["FAKE_STREAM_KEY"] = "sk-stream"
+        if old_key is None:
+            self.addCleanup(lambda: os.environ.pop("FAKE_STREAM_KEY", None))
+        else:
+            self.addCleanup(lambda: os.environ.__setitem__("FAKE_STREAM_KEY", old_key))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "gateway_tokens": ["agent-token"],
+                    "providers": {"openai": {
+                        "base_url": f"http://127.0.0.1:{provider.server_port}",
+                        "api_key_env": "FAKE_STREAM_KEY",
+                        "amount": 0.1,
+                    }},
+                }, f)
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), gateway_thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/openai/v1/chat/completions",
+                data=json.dumps({"model": "gpt-test", "stream": True}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": "Bearer agent-token",
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                self.assertIn("text/event-stream", resp.headers["content-type"])
+                self.assertEqual(resp.read(), b"data: one\n\ndata: [DONE]\n\n")
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                row = store.db.execute("SELECT reasons_json FROM gateway_decisions").fetchone()
+                self.assertNotIn("data: one", row["reasons_json"])
+
+    def test_report_contains_gateway_audit_sections(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        req = GuardRequest(
+            x_agent_id="research-bot",
+            rail="api_x402",
+            amount=0.25,
+            x_budget_id="team-research",
+            provider_name="x402",
+            service_name="/scrape",
+            x_merchant_id="0xtool",
+        )
+        store.reserve_and_record_gateway_decision(
+            request_id="report-req",
+            req=req,
+            decision="deny",
+            reasons=["blocked for test"],
+            route_type="target",
+            route_id="scraper-demo",
+        )
+        html = render(store, {}, [])
+        self.assertIn("Gateway blocked", html)
+        self.assertIn("Recent Gateway Decisions", html)
+        self.assertIn("research-bot", html)
 
     def test_store_migrates_existing_ledgers_to_current_schema(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:

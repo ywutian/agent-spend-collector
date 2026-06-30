@@ -1,6 +1,8 @@
 """Render a zero-dependency static HTML report from the ledger + alerts."""
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from html import escape
 
 from .detectors import Alert
@@ -190,6 +192,72 @@ def _section_alerts(alerts: list[Alert]) -> str:
     return "".join(p)
 
 
+def _section_gateway(store: SpendStore) -> str:
+    allowed = store.db.execute(
+        "SELECT COUNT(*) FROM gateway_decisions WHERE decision = 'allow'"
+    ).fetchone()[0]
+    blocked = store.db.execute(
+        "SELECT COUNT(*) FROM gateway_decisions WHERE decision = 'deny'"
+    ).fetchone()[0]
+    active = store.db.execute(
+        "SELECT COUNT(*) FROM spend_reservations WHERE status = 'active' AND expires_at > ?",
+        (datetime.now(timezone.utc).isoformat(),),
+    ).fetchone()[0]
+    p = [
+        "<section class='grid metrics'>",
+        f"<div class='metric'><div class='label'>Gateway allowed</div><div class='value'>{allowed}</div>"
+        "<div class='meta'>Pre-spend passes</div></div>",
+        f"<div class='metric'><div class='label'>Gateway blocked</div><div class='value'>{blocked}</div>"
+        "<div class='meta'>Denied before provider call</div></div>",
+        f"<div class='metric'><div class='label'>Active holds</div><div class='value'>{active}</div>"
+        "<div class='meta'>Reserved budget</div></div>",
+        "<div class='metric'><div class='label'>Prompt storage</div><div class='value small'>off</div>"
+        "<div class='meta'>Metadata-only audit</div></div>",
+        "</section>",
+        "<section class='grid two'>",
+        "<section class='panel'><h2>Top Blocked Agents</h2><table><tr><th>Agent</th><th>Blocks</th></tr>",
+    ]
+    rows = store.db.execute(
+        "SELECT x_agent_id, COUNT(*) AS blocks FROM gateway_decisions "
+        "WHERE decision = 'deny' GROUP BY x_agent_id ORDER BY blocks DESC LIMIT 5"
+    ).fetchall()
+    if not rows:
+        p.append("<tr><td colspan='2'>No gateway blocks yet.</td></tr>")
+    for r in rows:
+        p.append(f"<tr><td>{escape(r['x_agent_id'])}</td><td>{r['blocks']}</td></tr>")
+    p.append("</table></section>")
+    p.append("<section class='panel'><h2>Top Blocked Merchants</h2><table><tr><th>Merchant / Service</th><th>Blocks</th></tr>")
+    rows = store.db.execute(
+        "SELECT COALESCE(NULLIF(x_merchant_id, ''), service_name) AS merchant, COUNT(*) AS blocks "
+        "FROM gateway_decisions WHERE decision = 'deny' "
+        "GROUP BY merchant ORDER BY blocks DESC LIMIT 5"
+    ).fetchall()
+    if not rows:
+        p.append("<tr><td colspan='2'>No blocked merchants yet.</td></tr>")
+    for r in rows:
+        p.append(f"<tr><td>{escape(r['merchant'] or 'unknown')}</td><td>{r['blocks']}</td></tr>")
+    p.append("</table></section></section>")
+    p.append("<section class='panel'><h2>Recent Gateway Decisions</h2><table><tr>"
+             "<th>Time</th><th>Agent</th><th>Route</th><th>Decision</th><th>Reason</th></tr>")
+    rows = store.db.execute(
+        "SELECT created_at, x_agent_id, route_type, route_id, decision, reasons_json "
+        "FROM gateway_decisions ORDER BY created_at DESC LIMIT 8"
+    ).fetchall()
+    if not rows:
+        p.append("<tr><td colspan='5'>No gateway decisions yet.</td></tr>")
+    for r in rows:
+        reasons = ", ".join(json.loads(r["reasons_json"] or "[]"))
+        klass = "ok" if r["decision"] == "allow" else "high"
+        route = f"{r['route_type']}:{r['route_id']}" if r["route_id"] else r["route_type"]
+        p.append(
+            f"<tr><td>{escape(r['created_at'])}</td><td>{escape(r['x_agent_id'])}</td>"
+            f"<td>{escape(route)}</td><td><span class='pill {klass}'>{escape(r['decision'])}</span></td>"
+            f"<td>{escape(reasons)}</td></tr>"
+        )
+    p.append("</table></section>")
+    return "".join(p)
+
+
 def _section_agent_rail(store: SpendStore) -> str:
     p = ["<section class='panel'><h2>Agent x Rail</h2><table><tr>"
          "<th>Agent</th><th>Rail</th><th>Events</th><th class='num'>Spend</th></tr>"]
@@ -236,11 +304,12 @@ def render(store: SpendStore, caps: dict[str, float], alerts: list[Alert]) -> st
     p.append(_section_budgets(store, caps))
     p.append("</section>")
     p.append(_section_alerts(alerts))
+    p.append(_section_gateway(store))
     p.append("<section class='grid two'>")
     p.append(_section_agent_rail(store))
     p.append(_section_events(store))
     p.append("</section>")
-    p.append("<p class='footer'>This report is generated locally from the append-only ledger. "
-             "It does not move funds or enforce policy.</p>")
+    p.append("<p class='footer'>This report is generated locally from the ledger and gateway audit log. "
+             "The gateway can enforce policy only when agents route spend through it.</p>")
     p.append(_TAIL)
     return "".join(p)

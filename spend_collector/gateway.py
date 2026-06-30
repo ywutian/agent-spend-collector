@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from .store import SpendStore
 
@@ -34,6 +35,8 @@ class GuardDecision:
     decision: str
     reasons: list[str]
     request: dict[str, Any]
+    request_id: str = ""
+    reservation_id: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -57,12 +60,24 @@ def _agent_policy(policy: dict, agent: str) -> dict:
     return policy.get("agents", {}).get(agent, {})
 
 
+class PolicyError(ValueError):
+    pass
+
+
 def _spent_for_budget(store: SpendStore, budget: str) -> float:
     row = store.db.execute(
         "SELECT COALESCE(SUM(billed_cost), 0) AS spent FROM spend_events WHERE x_budget_id = ?",
         (budget,),
     ).fetchone()
     return float(row["spent"] or 0)
+
+
+def _budget_cap(policy: dict, agent: str, budget: str) -> float | None:
+    agent_policy = _agent_policy(policy, agent)
+    budgets = dict(policy.get("budgets", {}))
+    budgets.update(agent_policy.get("budgets_caps", {}))
+    cap = budgets.get(budget)
+    return float(cap) if cap is not None else None
 
 
 def _merchant_seen(store: SpendStore, req: GuardRequest) -> bool:
@@ -109,18 +124,17 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     if max_amount is not None and req.amount > float(max_amount):
         deny.append(f"amount {req.amount:.2f} exceeds max {float(max_amount):.2f}")
 
-    budgets = dict(policy.get("budgets", {}))
-    budgets.update(agent.get("budgets_caps", {}))
-    cap = budgets.get(req.x_budget_id)
+    cap = _budget_cap(policy, req.x_agent_id, req.x_budget_id)
     if cap is not None:
         spent = _spent_for_budget(store, req.x_budget_id)
-        if spent + req.amount > float(cap):
+        reserved = store.active_reservations_total(req.x_budget_id)
+        if spent + reserved + req.amount > float(cap):
             deny.append(
                 f"budget {req.x_budget_id} would exceed cap "
-                f"{spent + req.amount:.2f}/{float(cap):.2f}"
+                f"{spent + reserved + req.amount:.2f}/{float(cap):.2f}"
             )
         else:
-            reasons.append(f"budget {req.x_budget_id} remaining {float(cap) - spent - req.amount:.2f}")
+            reasons.append(f"budget {req.x_budget_id} remaining {float(cap) - spent - reserved - req.amount:.2f}")
 
     merchant_key = req.merchant_key()
     allowed_merchants = set(_list(agent.get("merchants")) or _list(policy.get("merchants")))
@@ -136,3 +150,122 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     if not reasons:
         reasons.append("policy checks passed")
     return GuardDecision("allow", reasons, asdict(req))
+
+
+def validate_policy(policy: dict) -> list[str]:
+    errors: list[str] = []
+    root_keys = {
+        "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
+        "warn_new_merchants", "deny_new_merchants", "agents", "merchants",
+        "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
+    }
+    agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
+    target_keys = {
+        "url", "method", "rail", "provider", "merchant", "service", "amount",
+        "budget", "headers", "headers_env", "timeout",
+    }
+    provider_keys = {
+        "base_url", "api_key_env", "rail", "provider", "merchant",
+        "service_from_body", "amount", "budget", "auth_header", "auth_prefix",
+        "method", "timeout", "agent", "max_estimated_amount",
+    }
+
+    if not isinstance(policy, dict):
+        return ["policy must be a JSON object"]
+    for key in policy:
+        if key not in root_keys:
+            errors.append(f"unknown policy key: {key}")
+    def has_raw_api_key(obj) -> bool:
+        if isinstance(obj, dict):
+            return any(k == "api_key" or has_raw_api_key(v) for k, v in obj.items())
+        if isinstance(obj, list):
+            return any(has_raw_api_key(v) for v in obj)
+        return False
+
+    if has_raw_api_key(policy):
+        errors.append("policy must not contain raw api_key values; use api_key_env")
+
+    if "budgets" in policy and not isinstance(policy["budgets"], dict):
+        errors.append("budgets must be an object")
+    if "reservation_ttl_seconds" in policy and int(policy["reservation_ttl_seconds"]) <= 0:
+        errors.append("reservation_ttl_seconds must be positive")
+
+    for agent, cfg in policy.get("agents", {}).items():
+        if not isinstance(cfg, dict):
+            errors.append(f"agent {agent} must be an object")
+            continue
+        for key in cfg:
+            if key not in agent_keys:
+                errors.append(f"unknown agent key for {agent}: {key}")
+
+    has_forwarding = bool(policy.get("providers") or policy.get("targets"))
+    if has_forwarding and not policy.get("gateway_tokens"):
+        errors.append("providers or targets require gateway_tokens or SPEND_GATEWAY_TOKEN")
+
+    for name, target in policy.get("targets", {}).items():
+        if not isinstance(target, dict):
+            errors.append(f"target {name} must be an object")
+            continue
+        for key in target:
+            if key not in target_keys:
+                errors.append(f"unknown target key for {name}: {key}")
+        for required in ("url", "rail", "amount"):
+            if required not in target:
+                errors.append(f"target {name} missing {required}")
+        for key, value in target.get("headers", {}).items():
+            if "authorization" in key.lower() or str(value).startswith(("sk-", "rk_")):
+                errors.append(f"target {name} header {key} looks like a raw secret; use headers_env")
+
+    for name, provider in policy.get("providers", {}).items():
+        if not isinstance(provider, dict):
+            errors.append(f"provider {name} must be an object")
+            continue
+        for key in provider:
+            if key not in provider_keys:
+                errors.append(f"unknown provider key for {name}: {key}")
+        if "base_url" not in provider:
+            errors.append(f"provider {name} missing base_url")
+        if "api_key_env" not in provider:
+            errors.append(f"provider {name} missing api_key_env")
+        if "amount" not in provider and "max_estimated_amount" not in provider:
+            errors.append(f"provider {name} missing amount or max_estimated_amount")
+
+    return errors
+
+
+def require_valid_policy(policy: dict, *, env_token: str | None = None) -> None:
+    check = dict(policy)
+    if env_token and not check.get("gateway_tokens"):
+        check["gateway_tokens"] = [env_token]
+    errors = validate_policy(check)
+    if errors:
+        raise PolicyError("; ".join(errors))
+
+
+def audit_config(policy: dict, *, db_path: str = "spend.db", out_dir: str = "artifacts",
+                 env_token_configured: bool = False) -> dict:
+    env_vars = set()
+    hosts = set()
+    for provider in policy.get("providers", {}).values():
+        if provider.get("api_key_env"):
+            env_vars.add(provider["api_key_env"])
+        if provider.get("base_url"):
+            hosts.add(urlsplit(provider["base_url"]).netloc)
+    for target in policy.get("targets", {}).values():
+        if target.get("url"):
+            hosts.add(urlsplit(target["url"]).netloc)
+        for value in target.get("headers_env", {}).values():
+            env_vars.add(value)
+    if policy.get("providers") or policy.get("targets"):
+        env_vars.add("SPEND_GATEWAY_TOKEN")
+    return {
+        "env_vars_read": sorted(env_vars),
+        "outbound_hosts": sorted(h for h in hosts if h),
+        "files_written": [db_path, f"{out_dir}/report.html", f"{out_dir}/alerts.json", f"{out_dir}/run-summary.json"],
+        "will_not_store": ["prompts", "responses", "request bodies", "provider keys", "gateway tokens"],
+        "gateway_token_configured": bool(policy.get("gateway_tokens") or env_token_configured),
+    }
+
+
+def cap_for_request(policy: dict, req: GuardRequest) -> float | None:
+    return _budget_cap(policy, req.x_agent_id, req.x_budget_id)

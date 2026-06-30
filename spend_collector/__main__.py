@@ -9,11 +9,19 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
 from .detectors import run_all
-from .gateway import GuardRequest, decide
+from .gateway import (
+    GuardRequest,
+    audit_config as build_audit_config,
+    cap_for_request,
+    decide,
+    require_valid_policy,
+    validate_policy as validate_policy_data,
+)
 from .report import render
 from .store import SpendStore
 
@@ -230,7 +238,36 @@ def _load_policy(path: str | Path | None) -> dict:
     return _load_json_file(path)
 
 
+def _request_id(value: str | None = None) -> str:
+    return value or f"req:{uuid.uuid4().hex}"
+
+
+def _decide_and_record(store: SpendStore, policy: dict, req: GuardRequest, *,
+                       request_id: str | None = None, route_type: str = "guard",
+                       route_id: str = "") -> dict:
+    request_id = _request_id(request_id)
+    existing = store.gateway_decision_as_dict(request_id)
+    if existing:
+        return existing
+    decision = decide(store, policy, req)
+    ttl = int(policy.get("reservation_ttl_seconds", 900))
+    cap = cap_for_request(policy, req)
+    store.reserve_and_record_gateway_decision(
+        request_id=request_id,
+        req=req,
+        decision=decision.decision,
+        reasons=decision.reasons,
+        route_type=route_type,
+        route_id=route_id,
+        ttl_seconds=ttl,
+        cap=cap,
+    )
+    return store.gateway_decision_as_dict(request_id) or decision.as_dict()
+
+
 def guard(args) -> dict:
+    policy = _load_policy(args.policy)
+    require_valid_policy(policy, env_token=os.environ.get("SPEND_GATEWAY_TOKEN"))
     req = GuardRequest(
         x_agent_id=args.agent,
         rail=args.rail,
@@ -242,7 +279,7 @@ def guard(args) -> dict:
         x_session_id=args.session or "",
     )
     with SpendStore(args.db) as store:
-        decision = decide(store, _load_policy(args.policy), req).as_dict()
+        decision = _decide_and_record(store, policy, req, request_id=args.request_id)
     print(json.dumps(decision, indent=2, sort_keys=True))
     if not decision["allowed"] and args.enforce_exit_code:
         sys.exit(2)
@@ -251,6 +288,9 @@ def guard(args) -> dict:
 
 def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Path | None = None,
                         host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
+    startup_policy = _load_policy(policy_path)
+    require_valid_policy(startup_policy, env_token=os.environ.get("SPEND_GATEWAY_TOKEN"))
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload: dict) -> None:
             body = json.dumps(payload, indent=2, sort_keys=True).encode()
@@ -269,6 +309,30 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_upstream(self, resp) -> None:
+            headers = dict(resp.headers.items())
+            content_type = headers.get("Content-Type", headers.get("content-type", ""))
+            transfer = headers.get("Transfer-Encoding", headers.get("transfer-encoding", ""))
+            is_stream = "text/event-stream" in content_type or "chunked" in transfer.lower()
+            self.send_response(resp.status)
+            for key, value in headers.items():
+                if key.lower() in {"connection", "content-length", "transfer-encoding"}:
+                    continue
+                self.send_header(key, value)
+            if not is_stream:
+                body = resp.read()
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.end_headers()
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("content-length", "0"))
@@ -290,8 +354,8 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             supplied = bearer or self.headers.get("x-gateway-token", "")
             return supplied in set(str(t) for t in tokens)
 
-        def _guard_payload(self, payload: dict) -> dict:
-            req = GuardRequest(
+        def _guard_request(self, payload: dict) -> GuardRequest:
+            return GuardRequest(
                 x_agent_id=str(payload["agent"]),
                 rail=str(payload["rail"]),
                 amount=float(payload["amount"]),
@@ -301,8 +365,22 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 x_merchant_id=str(payload.get("merchant", "")),
                 x_session_id=str(payload.get("session", "")),
             )
+
+        def _request_id(self, payload: dict) -> str:
+            return _request_id(self.headers.get("x-request-id") or payload.get("request_id"))
+
+        def _guard_payload(self, payload: dict, *, route_type: str = "guard",
+                           route_id: str = "") -> dict:
+            req = self._guard_request(payload)
             with SpendStore(str(db_path)) as store:
-                return decide(store, _load_policy(policy_path), req).as_dict()
+                return _decide_and_record(
+                    store,
+                    _load_policy(policy_path),
+                    req,
+                    request_id=self._request_id(payload),
+                    route_type=route_type,
+                    route_id=route_id,
+                )
 
         def _target_request(self, payload: dict, policy: dict) -> tuple[dict, dict]:
             target_id = str(payload["target"])
@@ -323,6 +401,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
 
         def _forward(self, target: dict, payload: dict) -> None:
             merged_headers = dict(target.get("headers", {}))
+            for header, env_name in target.get("headers_env", {}).items():
+                value = os.environ.get(str(env_name))
+                if value:
+                    merged_headers[str(header)] = value
             merged_headers.update(payload.get("headers", {}) or {})
             headers = {
                 str(k): str(v)
@@ -341,7 +423,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             req = urllib.request.Request(str(target["url"]), data=body, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=float(target.get("timeout", 30))) as resp:
-                    self._send_bytes(resp.status, resp.read(), dict(resp.headers.items()))
+                    self._send_upstream(resp)
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
@@ -408,7 +490,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             )
             try:
                 with urllib.request.urlopen(req, timeout=float(provider.get("timeout", 30))) as resp:
-                    self._send_bytes(resp.status, resp.read(), dict(resp.headers.items()))
+                    self._send_upstream(resp)
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
@@ -425,13 +507,21 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 if not self._authorized(policy):
                     self._send(401, {"error": "unauthorized"})
                     return
+                if self.path == "/reservations/release":
+                    request_id = str(payload["request_id"])
+                    with SpendStore(str(db_path)) as store:
+                        released = store.release_reservation(request_id)
+                    self._send(200, {"request_id": request_id, "released": released})
+                    return
                 if self.path == "/guard":
                     decision = self._guard_payload(payload)
                     self._send(200 if decision["allowed"] else 403, decision)
                     return
                 if self.path == "/forward":
                     target, guard_payload = self._target_request(payload, policy)
-                    decision = self._guard_payload(guard_payload)
+                    if "request_id" in payload:
+                        guard_payload["request_id"] = payload["request_id"]
+                    decision = self._guard_payload(guard_payload, route_type="target", route_id=str(payload["target"]))
                     if not decision["allowed"]:
                         self._send(403, decision)
                         return
@@ -441,7 +531,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 if provider_route:
                     provider_id, provider, suffix = provider_route
                     guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
-                    decision = self._guard_payload(guard_payload)
+                    decision = self._guard_payload(guard_payload, route_type="provider", route_id=provider_id)
                     if not decision["allowed"]:
                         self._send(403, decision)
                         return
@@ -466,6 +556,36 @@ def gateway(db_path: str | Path = "spend.db", policy_path: str | Path | None = N
     print(f"spend gateway listening on http://{host}:{port}")
     print("POST /guard for decisions; POST /forward to guard then proxy an allowlisted target")
     server.serve_forever()
+
+
+def validate_policy_cmd(policy_path: str) -> None:
+    policy = _load_policy(policy_path)
+    check = dict(policy)
+    if os.environ.get("SPEND_GATEWAY_TOKEN") and not check.get("gateway_tokens"):
+        check["gateway_tokens"] = [os.environ["SPEND_GATEWAY_TOKEN"]]
+    errors = validate_policy_data(check)
+    if errors:
+        for error in errors:
+            print(f"error: {error}")
+        sys.exit(1)
+    print("policy OK")
+
+
+def audit_config_cmd(policy_path: str, db_path: str = "spend.db", out_dir: str = "artifacts") -> None:
+    policy = _load_policy(policy_path)
+    report = build_audit_config(
+        policy,
+        db_path=db_path,
+        out_dir=out_dir,
+        env_token_configured=bool(os.environ.get("SPEND_GATEWAY_TOKEN")),
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def release_reservation_cmd(db_path: str, request_id: str) -> None:
+    with SpendStore(db_path) as store:
+        released = store.release_reservation(request_id)
+    print(json.dumps({"request_id": request_id, "released": released}, indent=2, sort_keys=True))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -514,6 +634,7 @@ def _parser() -> argparse.ArgumentParser:
     guard_p.add_argument("--service", help="model, endpoint, or merchant service")
     guard_p.add_argument("--merchant", help="merchant id/address")
     guard_p.add_argument("--session", help="task/session id")
+    guard_p.add_argument("--request-id", help="idempotency key for audit/reservation")
     guard_p.add_argument("--enforce-exit-code", action="store_true",
                          help="exit 2 on deny so callers can block the spend")
 
@@ -522,6 +643,18 @@ def _parser() -> argparse.ArgumentParser:
     gateway_p.add_argument("--policy", help="gateway policy JSON; defaults to SPEND_POLICY_FILE")
     gateway_p.add_argument("--host", default="127.0.0.1", help="bind host")
     gateway_p.add_argument("--port", type=int, default=8787, help="bind port")
+
+    validate_p = sub.add_parser("validate-policy", help="strictly validate gateway policy JSON")
+    validate_p.add_argument("--policy", required=True, help="gateway policy JSON")
+
+    audit_p = sub.add_parser("audit-config", help="show env vars, outbound hosts, and local files")
+    audit_p.add_argument("--policy", required=True, help="gateway policy JSON")
+    audit_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    audit_p.add_argument("--out-dir", default="artifacts", help="artifact directory")
+
+    release_p = sub.add_parser("release-reservation", help="release an active gateway reservation")
+    release_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    release_p.add_argument("--request-id", required=True, help="gateway request id")
 
     return parser
 
@@ -543,6 +676,12 @@ def main(argv: list[str] | None = None) -> None:
         guard(args)
     elif cmd == "gateway":
         gateway(args.db, args.policy, args.host, args.port)
+    elif cmd == "validate-policy":
+        validate_policy_cmd(args.policy)
+    elif cmd == "audit-config":
+        audit_config_cmd(args.policy, args.db, args.out_dir)
+    elif cmd == "release-reservation":
+        release_reservation_cmd(args.db, args.request_id)
 
 
 if __name__ == "__main__":

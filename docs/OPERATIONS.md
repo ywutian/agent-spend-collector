@@ -56,6 +56,8 @@ Use the gateway when an agent can ask before spending. Start with
 
 ```bash
 export SPEND_POLICY_FILE=gateway.example.json
+python3 -m spend_collector validate-policy --policy "$SPEND_POLICY_FILE"
+python3 -m spend_collector audit-config --policy "$SPEND_POLICY_FILE"
 python3 -m spend_collector gateway --db spend.db --policy "$SPEND_POLICY_FILE"
 ```
 
@@ -105,6 +107,13 @@ X-Budget-ID = team-research
 
 The gateway swaps the gateway token for the provider key only after an allow
 decision. If the policy denies the call, the provider is never contacted.
+Every allow/deny is written to `gateway_decisions`. Allow decisions create
+short-lived budget holds in `spend_reservations`; release a hold if an allowed
+downstream call fails before money moves:
+
+```bash
+python3 -m spend_collector release-reservation --db spend.db --request-id req_123
+```
 
 ## Failure Handling
 

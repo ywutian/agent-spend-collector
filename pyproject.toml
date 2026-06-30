@@ -47,6 +47,7 @@ include = [
   "tests",
   "docs",
   "README.md",
+  "SECURITY.md",
   "LICENSE",
   "pyproject.toml",
   ".env.example",

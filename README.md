@@ -99,6 +99,15 @@ python3 -m spend_collector report --db path/to/spend.db --out-dir artifacts
 The collector can also sit in front of agent spend. An agent asks before it
 spends; the gateway returns `allow` or `deny` from policy plus ledger history.
 
+## Trust model
+
+The gateway is self-hosted by default. Real provider keys should stay in your
+environment variables or secret manager, not in policy files. Agents receive only
+gateway tokens; the gateway swaps that token for a provider key only after an
+allow decision. The project does not call project-owned servers, and gateway
+audit logs store metadata only: no prompts, request bodies, completions,
+responses, provider keys, or gateway tokens. See `SECURITY.md`.
+
 Try a one-off decision:
 
 ```bash
@@ -162,6 +171,19 @@ headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
 
 The gateway checks policy, replaces the gateway token with `OPENAI_API_KEY`, and
 forwards the original request to OpenAI only when allowed.
+
+Validate and audit the gateway config before starting it:
+
+```bash
+python3 -m spend_collector validate-policy --policy gateway.example.json
+python3 -m spend_collector audit-config --policy gateway.example.json
+```
+
+If an allowed downstream call fails before money moves, release its hold:
+
+```bash
+python3 -m spend_collector release-reservation --db spend.db --request-id req_123
+```
 
 This is the first inline-control layer: it does not move funds, but callers can
 block the spend when the decision is `deny`.
