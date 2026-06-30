@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 from spend_collector.__main__ import _alert_row, _load_budgets, _run_summary, main, make_gateway_server
-from spend_collector.adapters import from_llm_usage, from_stripe_events, from_x402_settlements
+from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide
 from spend_collector.report import render
@@ -837,6 +837,12 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(rows[0]["provider"], "openai")
         self.assertEqual(rows[0]["api_key_id"], "key-1")
         self.assertEqual(rows[0]["model"], "gpt-5, input")
+
+    def test_price_longest_prefix_match(self) -> None:
+        self.assertAlmostEqual(_price("gpt-4o", 1_000_000, 0), 2.5)              # exact
+        self.assertAlmostEqual(_price("gpt-4o-2024-08-06", 1_000_000, 0), 2.5)   # dated -> prefix
+        self.assertAlmostEqual(_price("gpt-4o-mini-2024-07-18", 1_000_000, 0), 0.15)  # longest wins
+        self.assertEqual(_price("totally-unknown", 1_000_000, 1_000_000), 0.0)   # unknown -> 0
 
 
 if __name__ == "__main__":
