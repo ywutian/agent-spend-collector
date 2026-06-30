@@ -88,6 +88,9 @@ export STRIPE_SECRET_KEY=rk_live_...
 python3 -m spend_collector pull-stripe
 ```
 
+Or do it all at once: **`scripts/dogfood.sh`** pulls whatever creds are set and opens the
+dashboard. After any pull(s), `python3 -m spend_collector report` re-renders `report.html`.
+
 All commands write to `spend.db` and run the detectors. Attribution:
 
 - LLM: one API key per agent.

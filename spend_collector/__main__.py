@@ -130,6 +130,22 @@ def pull_stripe() -> None:
         print(f"  [{a.severity}] {a.kind} {a.subject} {a.detail}")
 
 
+def report() -> None:
+    """Render report.html from the accumulated spend.db (after one or more pulls)."""
+    store = SpendStore("spend.db")
+    if store.total() == 0:
+        print("spend.db is empty -- run a pull first (pull / pull-x402 / pull-stripe).")
+        sys.exit(1)
+    _print_summary(store)
+    alerts = run_all(store, {})
+    print("\nAlerts:")
+    for a in alerts:
+        print(f"  [{a.severity:<4}] {a.kind:<22} {a.subject:<13} {a.detail}")
+    with open("report.html", "w", encoding="utf-8") as f:
+        f.write(render(store, {}, alerts))
+    print("\nWrote report.html  (open in a browser)")
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "demo"
     if cmd == "demo":
@@ -140,8 +156,10 @@ def main() -> None:
         pull_x402()
     elif cmd == "pull-stripe":
         pull_stripe()
+    elif cmd == "report":
+        report()
     else:
-        print("usage: python3 -m spend_collector [demo|pull|pull-x402|pull-stripe]")
+        print("usage: python3 -m spend_collector [demo|pull|pull-x402|pull-stripe|report]")
         sys.exit(1)
 
 
