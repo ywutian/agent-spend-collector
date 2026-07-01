@@ -893,6 +893,35 @@ class CollectorTest(unittest.TestCase):
         # a stream that carried no usage -> nothing to record
         self.assertIsNone(_usage_body_from_sse(b'data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n'))
 
+    def test_gateway_dashboard_route_renders_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({"gateway_tokens": ["dash-token"], "budgets": {"team": 5.0}}, f)
+            with SpendStore(str(db_path)) as store:
+                store.ingest([SpendEvent(
+                    "evt-dash", "2026-06-30T01:00:00Z", "llm_token", "openai", "gpt-4o-mini",
+                    0.01, "USD", 100, "token", "study-abroad-api", "team")])
+
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            port = gateway_server.server_port
+            thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{port}/health")
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard?token=dash-token", timeout=2) as resp:
+                body = resp.read().decode()
+                self.assertEqual(resp.status, 200)
+                self.assertIn("text/html", resp.headers.get("content-type", ""))
+            self.assertIn("Agent Spend Console", body)
+            self.assertIn("study-abroad-api", body)
+
+            with self.assertRaises(urllib.error.HTTPError) as err:  # no token -> 401
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2)
+            self.assertEqual(err.exception.code, 401)
+
 
 if __name__ == "__main__":
     unittest.main()
