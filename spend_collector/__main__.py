@@ -392,7 +392,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 raise ValueError("request body must be a JSON object")
             return payload
 
-        def _authorized(self, policy: dict) -> bool:
+        def _authorized(self, policy: dict, token: str = "") -> bool:
             tokens = policy.get("gateway_tokens")
             env_token = os.environ.get("SPEND_GATEWAY_TOKEN")
             if env_token:
@@ -401,7 +401,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 return True
             auth = self.headers.get("authorization", "")
             bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-            supplied = bearer or self.headers.get("x-gateway-token", "")
+            supplied = token or bearer or self.headers.get("x-gateway-token", "")
             return supplied in set(str(t) for t in tokens)
 
         def _guard_request(self, payload: dict) -> GuardRequest:
@@ -554,10 +554,22 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/health":
                 self._send(200, {"ok": True})
-            else:
-                self._send(404, {"error": "not found"})
+                return
+            if parsed.path in ("/", "/dashboard"):
+                policy = _load_policy(policy_path)
+                token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+                if not self._authorized(policy, token):
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                budgets = _load_budgets(policy.get("budgets") or {})
+                with SpendStore(str(db_path)) as store:
+                    html = render(store, budgets, run_all(store, budgets))
+                self._send_bytes(200, html.encode("utf-8"), {"content-type": "text/html; charset=utf-8"})
+                return
+            self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:
             try:
