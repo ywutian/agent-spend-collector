@@ -14,7 +14,10 @@ import urllib.request
 import unittest
 from pathlib import Path
 
-from spend_collector.__main__ import _alert_row, _load_budgets, _run_summary, main, make_gateway_server
+from spend_collector.__main__ import (
+    _alert_row, _load_budgets, _run_summary, _usage_body_from_sse, _with_stream_usage,
+    main, make_gateway_server,
+)
 from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
@@ -862,6 +865,33 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(store.total(), event.billed_cost)
         # streamed body with no usage records nothing
         self.assertIsNone(record_forwarded_spend(store, b"data: [DONE]\n", provider, guard_payload))
+
+    def test_gateway_records_streamed_spend(self) -> None:
+        # stream:true -> gateway asks the provider for a final usage chunk
+        injected = json.loads(_with_stream_usage(json.dumps({"model": "gpt-4o-mini", "stream": True}).encode()))
+        self.assertTrue(injected["stream_options"]["include_usage"])
+        plain = json.dumps({"model": "gpt-4o-mini"}).encode()  # non-stream / non-json pass through
+        self.assertEqual(_with_stream_usage(plain), plain)
+        self.assertNotIn(b"stream_options", _with_stream_usage(b"not json"))
+
+        # a streamed SSE tail -> synthetic body -> priced + recorded
+        sse = (
+            b'data: {"id":"chatcmpl-9","model":"gpt-4o-mini","choices":[{"delta":{"content":"hi"}}],"usage":null}\n\n'
+            b'data: {"id":"chatcmpl-9","model":"gpt-4o-mini","choices":[],'
+            b'"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        body = _usage_body_from_sse(sse)
+        self.assertIsNotNone(body)
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, body, {"provider": "openai"},
+                                       {"agent": "advisor-bot", "budget": "team-edu"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertAlmostEqual(event.billed_cost, (1000 * 0.15 + 500 * 0.6) / 1_000_000)
+        # a stream that carried no usage -> nothing to record
+        self.assertIsNone(_usage_body_from_sse(b'data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n'))
 
 
 if __name__ == "__main__":

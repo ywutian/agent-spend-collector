@@ -51,6 +51,50 @@ def _load_budgets(default: dict[str, float] | None = None) -> dict[str, float]:
     return {str(k): float(v) for k, v in data.items()}
 
 
+def _with_stream_usage(raw: bytes) -> bytes:
+    """Streamed chat responses omit token usage, so streamed spend can't be priced.
+    For a `stream: true` body, ask the provider to emit a final usage chunk
+    (OpenAI-compatible: stream_options.include_usage). Non-stream bodies pass through.
+    """
+    try:
+        data = json.loads(raw or b"{}")
+    except (ValueError, TypeError):
+        return raw
+    if not isinstance(data, dict) or not data.get("stream"):
+        return raw
+    opts = dict(data["stream_options"]) if isinstance(data.get("stream_options"), dict) else {}
+    if opts.get("include_usage"):
+        return raw
+    opts["include_usage"] = True
+    data["stream_options"] = opts
+    return json.dumps(data).encode()
+
+
+def _usage_body_from_sse(tail: bytes) -> bytes | None:
+    """Pull the final usage-bearing SSE chunk from a streamed response tail and return
+    a synthetic non-stream body {id, model, usage} that record_forwarded_spend can
+    price. Returns None if the stream carried no usage (nothing to record).
+    """
+    found = None
+    for line in tail.decode("utf-8", "ignore").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[len("data:"):].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            obj = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("usage"):
+            found = obj
+    if found is None:
+        return None
+    return json.dumps({"id": found.get("id"), "model": found.get("model"),
+                       "usage": found["usage"]}).encode()
+
+
 def _print_summary(store: SpendStore) -> None:
     print(f"\nTotal agent spend: ${store.total():.4f}   (one ledger, all rails)\n")
     print("By agent x rail:")
@@ -328,13 +372,17 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 self.wfile.write(body)
                 return body
             self.end_headers()
+            tail = bytearray()  # ponytail: keep last 64KB; the usage chunk is small and last
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
-            return None
+                tail += chunk
+                if len(tail) > 65536:
+                    del tail[:-65536]
+            return _usage_body_from_sse(bytes(tail))
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("content-length", "0"))
@@ -485,9 +533,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                               guard_payload: dict | None = None, request_id: str = "") -> None:
             url = str(provider["base_url"]).rstrip("/") + suffix
             method = str(provider.get("method", "POST")).upper()
+            body = _with_stream_usage(getattr(self, "_raw_body", b""))
             req = urllib.request.Request(
                 url,
-                data=getattr(self, "_raw_body", b""),
+                data=body,
                 headers=self._provider_headers(provider),
                 method=method,
             )
