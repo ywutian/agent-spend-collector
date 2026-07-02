@@ -21,7 +21,7 @@ from spend_collector.__main__ import (
 from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
-from spend_collector.report import render
+from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
     _env_int, _request_json, decode_transfer_log, fetch_openai_costs, from_llm_cost_rows,
@@ -892,6 +892,13 @@ class CollectorTest(unittest.TestCase):
         self.assertAlmostEqual(event.billed_cost, (1000 * 0.15 + 500 * 0.6) / 1_000_000)
         # a stream that carried no usage -> nothing to record
         self.assertIsNone(_usage_body_from_sse(b'data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n'))
+
+    def test_money_formatting_shows_subcent_costs(self) -> None:
+        self.assertEqual(_money(0), "$0.00")
+        self.assertEqual(_money(12.5), "$12.50")
+        self.assertEqual(_money(1234.5), "$1,234.50")
+        self.assertEqual(_money(0.0000018), "$0.000002")  # sub-cent LLM call, not "$0.00"
+        self.assertEqual(_money(0.0034), "$0.0034")
 
     def test_chunked_json_is_not_treated_as_event_stream(self) -> None:
         # regression: OpenAI sends non-stream JSON with Transfer-Encoding: chunked;

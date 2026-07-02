@@ -73,6 +73,9 @@ _TAIL = "</div></body></html>"
 
 
 def _money(value: float) -> str:
+    # Agent LLM spend is often sub-cent; plain ${:.2f} renders real costs as "$0.00".
+    if 0 < abs(value) < 0.005:
+        return "$" + f"{value:.6f}".rstrip("0").rstrip(".")
     return f"${value:,.2f}"
 
 
