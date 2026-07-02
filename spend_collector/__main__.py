@@ -95,6 +95,15 @@ def _usage_body_from_sse(tail: bytes) -> bytes | None:
                        "usage": found["usage"]}).encode()
 
 
+def _is_event_stream(content_type: str) -> bool:
+    """A forwarded response needs SSE usage-teeing only if it is a real event
+    stream. Chunked transfer-encoding is just HTTP framing (OpenAI sends ordinary
+    JSON chunked too) and must NOT trigger stream handling, or the response gets
+    SSE-parsed, finds no usage, and the spend goes unrecorded.
+    """
+    return "text/event-stream" in (content_type or "").lower()
+
+
 def _print_summary(store: SpendStore) -> None:
     print(f"\nTotal agent spend: ${store.total():.4f}   (one ledger, all rails)\n")
     print("By agent x rail:")
@@ -358,8 +367,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
         def _send_upstream(self, resp) -> bytes | None:
             headers = dict(resp.headers.items())
             content_type = headers.get("Content-Type", headers.get("content-type", ""))
-            transfer = headers.get("Transfer-Encoding", headers.get("transfer-encoding", ""))
-            is_stream = "text/event-stream" in content_type or "chunked" in transfer.lower()
+            is_stream = _is_event_stream(content_type)
             self.send_response(resp.status)
             for key, value in headers.items():
                 if key.lower() in {"connection", "content-length", "transfer-encoding"}:
