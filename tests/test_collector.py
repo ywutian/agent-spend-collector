@@ -15,8 +15,8 @@ import unittest
 from pathlib import Path
 
 from spend_collector.__main__ import (
-    _alert_row, _load_budgets, _run_summary, _usage_body_from_sse, _with_stream_usage,
-    main, make_gateway_server,
+    _alert_row, _is_event_stream, _load_budgets, _run_summary, _usage_body_from_sse,
+    _with_stream_usage, main, make_gateway_server,
 )
 from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
 from spend_collector.detectors import run_all
@@ -892,6 +892,15 @@ class CollectorTest(unittest.TestCase):
         self.assertAlmostEqual(event.billed_cost, (1000 * 0.15 + 500 * 0.6) / 1_000_000)
         # a stream that carried no usage -> nothing to record
         self.assertIsNone(_usage_body_from_sse(b'data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n'))
+
+    def test_chunked_json_is_not_treated_as_event_stream(self) -> None:
+        # regression: OpenAI sends non-stream JSON with Transfer-Encoding: chunked;
+        # detecting that as a stream SSE-parsed plain JSON, dropped usage, and the
+        # forwarded spend went unrecorded. Only Content-Type text/event-stream counts.
+        self.assertFalse(_is_event_stream("application/json"))
+        self.assertFalse(_is_event_stream("application/json; charset=utf-8"))
+        self.assertTrue(_is_event_stream("text/event-stream"))
+        self.assertTrue(_is_event_stream("text/event-stream; charset=utf-8"))
 
     def test_gateway_dashboard_route_renders_html(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
