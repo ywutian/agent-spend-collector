@@ -574,7 +574,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     return
                 budgets = _load_budgets(policy.get("budgets") or {})
                 with SpendStore(str(db_path)) as store:
-                    html = render(store, budgets, run_all(store, budgets))
+                    html = render(store, budgets, run_all(store, budgets), refresh_seconds=30)
                 self._send_bytes(200, html.encode("utf-8"), {"content-type": "text/html; charset=utf-8"})
                 return
             self._send(404, {"error": "not found"})

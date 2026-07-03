@@ -115,6 +115,20 @@ downstream call fails before money moves:
 python3 -m spend_collector release-reservation --db spend.db --request-id req_123
 ```
 
+## Live Dashboard and Service Restart
+
+A running gateway also serves the dashboard live at `GET /dashboard`, token-gated
+via `?token=<token>` or the `Authorization` header. It re-renders from `spend.db`
+on every request and auto-refreshes in the browser, so a persistent gateway doubles
+as an always-on monitor. If you run it under macOS `launchd`, restart it in place:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.agentspend.gateway
+```
+
+Prefer `kickstart -k` over back-to-back `bootout`+`bootstrap`, which can race and
+fail with `Input/output error` while the previous instance is still exiting.
+
 ## Failure Handling
 
 Live HTTP/RPC pulls use bounded timeouts and retries. If a pull fails, rerun it:

@@ -23,6 +23,7 @@ _PRICES = {
     "o1": (15.0, 60.0),
     "deepseek-chat": (0.27, 1.1),
     "claude-opus-4-8": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
     "claude-haiku-4-5": (0.8, 4.0),
 }
 

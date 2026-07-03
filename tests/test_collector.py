@@ -866,6 +866,20 @@ class CollectorTest(unittest.TestCase):
         # streamed body with no usage records nothing
         self.assertIsNone(record_forwarded_spend(store, b"data: [DONE]\n", provider, guard_payload))
 
+    def test_gateway_records_anthropic_usage_shape(self) -> None:
+        # Anthropic returns input_tokens/output_tokens, not prompt_/completion_tokens
+        raw = json.dumps({
+            "id": "msg_1", "model": "claude-opus-4-8",
+            "usage": {"input_tokens": 1000, "output_tokens": 500},
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, {"provider": "anthropic"},
+                                       {"agent": "advisor-bot", "budget": "team-edu"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertGreater(event.billed_cost, 0)  # claude-opus-4-8 is priced
+
     def test_gateway_records_streamed_spend(self) -> None:
         # stream:true -> gateway asks the provider for a final usage chunk
         injected = json.loads(_with_stream_usage(json.dumps({"model": "gpt-4o-mini", "stream": True}).encode()))
@@ -899,6 +913,12 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(_money(1234.5), "$1,234.50")
         self.assertEqual(_money(0.0000018), "$0.000002")  # sub-cent LLM call, not "$0.00"
         self.assertEqual(_money(0.0034), "$0.0034")
+
+    def test_dashboard_refresh_only_when_requested(self) -> None:
+        store, budgets = self.build_demo_store()
+        alerts = run_all(store, budgets)
+        self.assertNotIn('http-equiv="refresh"', render(store, budgets, alerts))
+        self.assertIn('http-equiv="refresh" content="30"', render(store, budgets, alerts, refresh_seconds=30))
 
     def test_chunked_json_is_not_treated_as_event_stream(self) -> None:
         # regression: OpenAI sends non-stream JSON with Transfer-Encoding: chunked;
