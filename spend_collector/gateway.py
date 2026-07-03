@@ -292,8 +292,9 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         return None
     pname = str(provider.get("provider", "openai"))
     model = str(data.get("model") or guard_payload.get("service") or pname)
-    prompt = int(usage.get("prompt_tokens", 0) or 0)
-    completion = int(usage.get("completion_tokens", 0) or 0)
+    # OpenAI: prompt_tokens/completion_tokens. Anthropic: input_tokens/output_tokens.
+    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
     rid = str(data.get("id") or f"{guard_payload.get('agent', 'agent')}:{prompt}:{completion}")
     event = SpendEvent(
         event_id=f"gw:{rid}",

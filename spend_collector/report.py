@@ -294,8 +294,16 @@ def _section_events(store: SpendStore) -> str:
     return "".join(p)
 
 
-def render(store: SpendStore, caps: dict[str, float], alerts: list[Alert]) -> str:
-    p = [_HEAD]
+def render(store: SpendStore, caps: dict[str, float], alerts: list[Alert],
+           refresh_seconds: int | None = None) -> str:
+    head = _HEAD
+    if refresh_seconds:  # live dashboard auto-refreshes; static snapshots do not
+        head = head.replace(
+            '<meta name="viewport"',
+            f'<meta http-equiv="refresh" content="{int(refresh_seconds)}"><meta name="viewport"',
+            1,
+        )
+    p = [head]
     p.append(
         "<header><div><h1>Agent Spend Console</h1>"
         "<p class='sub'>Read-only cross-rail ledger and Phase-0 security signals.</p></div>"
