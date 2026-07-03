@@ -39,6 +39,10 @@ packages = ["spend_collector"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "fixtures" = "fixtures"
+"spend.config.example.json" = "spend.config.example.json"
+"wallet-map.example.json" = "wallet-map.example.json"
+"gateway.example.json" = "gateway.example.json"
+"budgets.example.json" = "budgets.example.json"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -52,5 +56,7 @@ include = [
   "pyproject.toml",
   ".env.example",
   "budgets.example.json",
+  "spend.config.example.json",
+  "wallet-map.example.json",
   "gateway.example.json",
 ]

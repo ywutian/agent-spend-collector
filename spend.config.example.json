@@ -1,0 +1,45 @@
+{
+  "db": "spend.db",
+  "out_dir": "artifacts",
+  "days": 7,
+  "lookback_blocks": 2000,
+  "budgets": {
+    "team-research": 10.0,
+    "team-support": 8.0,
+    "team-ops": 25.0,
+    "default": 100.0
+  },
+  "wallets": {
+    "0xresearchwallet": {
+      "agent_id": "research-bot",
+      "budget_id": "team-research"
+    },
+    "0xsupportwallet": {
+      "agent_id": "support-bot",
+      "budget_id": "team-support"
+    },
+    "0xopswallet": {
+      "agent_id": "ops-bot",
+      "budget_id": "team-ops"
+    }
+  },
+  "rails": {
+    "llm": {
+      "enabled": false,
+      "provider": "anthropic",
+      "api_key_env": "ANTHROPIC_ADMIN_KEY"
+    },
+    "x402": {
+      "enabled": true,
+      "pay_to": "0xYourX402ReceivingAddress"
+    },
+    "usdc": {
+      "enabled": true,
+      "pay_to": "0xYourUSDCReceivingAddress"
+    },
+    "stripe": {
+      "enabled": false,
+      "api_key_env": "STRIPE_SECRET_KEY"
+    }
+  }
+}

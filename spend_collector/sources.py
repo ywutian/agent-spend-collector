@@ -190,6 +190,10 @@ def env_pay_to() -> str | None:
     return os.environ.get("X402_PAY_TO")
 
 
+def env_usdc_pay_to() -> str | None:
+    return os.environ.get("USDC_PAY_TO") or os.environ.get("X402_PAY_TO")
+
+
 def _rpc(method: str, params: list, rpc_url: str) -> object:
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     req = urllib.request.Request(rpc_url, data=body, headers={"content-type": "application/json"})

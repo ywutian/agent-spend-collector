@@ -1,5 +1,5 @@
 {
-  "rails": ["llm_token", "api_x402", "card"],
+  "rails": ["llm_token", "api_x402", "stablecoin", "card"],
   "budgets": {
     "team-research": 10.0,
     "team-support": 8.0,
@@ -8,6 +8,7 @@
   "max_amount": 5.0,
   "max_amount_by_rail": {
     "api_x402": 3.0,
+    "stablecoin": 25.0,
     "card": 10.0
   },
   "warn_new_merchants": true,
@@ -15,7 +16,7 @@
   "agents": {
     "research-bot": {
       "budgets": ["team-research"],
-      "rails": ["llm_token", "api_x402"],
+      "rails": ["llm_token", "api_x402", "stablecoin"],
       "max_amount": 3.0
     },
     "support-bot": {

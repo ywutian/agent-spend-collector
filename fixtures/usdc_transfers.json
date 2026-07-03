@@ -1,0 +1,28 @@
+[
+  {
+    "transaction": "0xusdc001",
+    "amount": "7.25",
+    "asset": "USDC",
+    "network": "base",
+    "payer": "0xopswallet",
+    "pay_to": "0xmerchantwallet",
+    "merchant_id": "data-vendor-wallet",
+    "resource": "direct wallet payment",
+    "agent_id": "ops-bot",
+    "budget_id": "team-ops",
+    "session_id": "ops-recon-1",
+    "event_time": "2026-06-29T04:30:00Z"
+  },
+  {
+    "transaction": "0xusdc002",
+    "amount": "1.75",
+    "asset": "USDC",
+    "network": "base",
+    "payer": "0xresearchwallet",
+    "pay_to": "0xmerchantwallet",
+    "resource": "direct wallet payment",
+    "agent_id": "research-bot",
+    "budget_id": "team-research",
+    "event_time": "2026-06-29T05:30:00Z"
+  }
+]

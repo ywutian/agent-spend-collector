@@ -18,7 +18,9 @@ from spend_collector.__main__ import (
     _alert_row, _is_event_stream, _load_budgets, _run_summary, _usage_body_from_sse,
     _with_stream_usage, main, make_gateway_server,
 )
-from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
+from spend_collector.adapters import (
+    _price, from_llm_usage, from_stripe_events, from_usdc_transfers, from_x402_settlements,
+)
 from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
 from spend_collector.report import _money, render
@@ -53,6 +55,7 @@ class CollectorTest(unittest.TestCase):
         self.addCleanup(store.close)
         store.ingest(from_llm_usage(load_fixture("llm_usage.json")))
         store.ingest(from_x402_settlements(load_fixture("x402_settlements.json")))
+        store.ingest(from_usdc_transfers(load_fixture("usdc_transfers.json")))
         store.ingest(from_stripe_events(load_fixture("stripe_events.json")))
         return store, load_fixture("budgets.json")
 
@@ -61,9 +64,9 @@ class CollectorTest(unittest.TestCase):
         alerts = run_all(store, budgets)
         kinds = {a.kind for a in alerts}
 
-        self.assertAlmostEqual(store.total(), 27.112, places=3)
+        self.assertAlmostEqual(store.total(), 36.112, places=3)
         self.assertEqual(
-            {"api_x402", "card", "llm_token"},
+            {"api_x402", "card", "llm_token", "stablecoin"},
             {r["rail"] for r in store.by("rail")},
         )
         self.assertTrue({
@@ -82,7 +85,7 @@ class CollectorTest(unittest.TestCase):
             "SELECT rail, x_receipt_ref, x_source_event FROM spend_events"
         ).fetchall()
 
-        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(rows), 17)
         for row in rows:
             self.assertTrue(row["x_receipt_ref"])
             self.assertIn(":sha256:", row["x_source_event"])
@@ -142,6 +145,38 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(decoded["amount_raw"], 2_500_000)
         self.assertEqual(decoded["block"], 16)
 
+    def test_usdc_adapter_maps_direct_transfers_to_stablecoin_rail(self) -> None:
+        rows = from_usdc_transfers(load_fixture("usdc_transfers.json"))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].rail, "stablecoin")
+        self.assertEqual(rows[0].provider_name, "usdc:base")
+        self.assertEqual(rows[0].billing_currency, "USDC")
+        self.assertEqual(rows[0].billed_cost, 7.25)
+        self.assertEqual(rows[0].consumed_quantity, 7.25)
+        self.assertEqual(rows[0].pricing_unit, "usdc")
+        self.assertEqual(rows[0].x_agent_id, "ops-bot")
+        self.assertEqual(rows[0].x_budget_id, "team-ops")
+        self.assertEqual(rows[0].x_merchant_id, "data-vendor-wallet")
+        self.assertTrue(rows[0].x_receipt_ref.startswith("0xusdc"))
+
+    def test_wallet_map_overrides_onchain_payer_attribution(self) -> None:
+        transfer = {
+            "transaction": "0xwalletmap",
+            "amount": "2.50",
+            "asset": "USDC",
+            "network": "base",
+            "payer": "0xabc",
+            "pay_to": "0xmerchant",
+            "event_time": "2026-06-29T04:30:00Z",
+        }
+        wallet_map = {"0xabc": {"agent_id": "mapped-bot", "budget_id": "team-mapped"}}
+
+        [row] = from_usdc_transfers([transfer], wallet_map=wallet_map)
+
+        self.assertEqual(row.x_agent_id, "mapped-bot")
+        self.assertEqual(row.x_budget_id, "team-mapped")
+
     def test_report_contains_console_sections(self) -> None:
         store, budgets = self.build_demo_store()
         html = render(store, budgets, run_all(store, budgets))
@@ -169,6 +204,70 @@ class CollectorTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     main(["report", "--db", str(missing), "--out-dir", tmp])
             self.assertFalse(missing.exists())
+
+    def test_cli_pull_usdc_requires_receiving_address(self) -> None:
+        old_usdc = os.environ.pop("USDC_PAY_TO", None)
+        old_x402 = os.environ.pop("X402_PAY_TO", None)
+        self.addCleanup(lambda: os.environ.__setitem__("USDC_PAY_TO", old_usdc) if old_usdc is not None else None)
+        self.addCleanup(lambda: os.environ.__setitem__("X402_PAY_TO", old_x402) if old_x402 is not None else None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    main(["pull-usdc", "--db", str(Path(tmp) / "spend.db"), "--out-dir", tmp])
+
+        self.assertIn("USDC receiving address", stdout.getvalue())
+
+    def test_cli_pull_all_uses_config_and_wallet_map(self) -> None:
+        import spend_collector.sources as sources
+        original_fetch = sources.fetch_base_usdc_transfers
+
+        def fake_fetch(pay_to, **kwargs):
+            return [{
+                "transaction": "0x" + str(pay_to)[-4:],
+                "amount": "2.00",
+                "asset": "USDC",
+                "network": "base",
+                "payer": "0xabc",
+                "pay_to": str(pay_to),
+                "resource": "/paid",
+                "event_time": "2026-06-29T04:30:00Z",
+            }]
+
+        sources.fetch_base_usdc_transfers = fake_fetch
+        self.addCleanup(lambda: setattr(sources, "fetch_base_usdc_transfers", original_fetch))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "spend.config.json"
+            db_path = tmp_path / "spend.db"
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "db": str(db_path),
+                    "out_dir": str(tmp_path / "artifacts"),
+                    "budgets": {"team-mapped": 10.0},
+                    "wallets": {"0xabc": {"agent_id": "mapped-bot", "budget_id": "team-mapped"}},
+                    "rails": {
+                        "llm": {"enabled": False},
+                        "stripe": {"enabled": False},
+                        "x402": {"enabled": True, "pay_to": "0xx402"},
+                        "usdc": {"enabled": True, "pay_to": "0xusdc"},
+                    },
+                }, f)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["pull-all", "--config", str(config_path)])
+
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                rows = store.db.execute(
+                    "SELECT rail, x_agent_id, x_budget_id FROM spend_events ORDER BY rail"
+                ).fetchall()
+
+        self.assertEqual([r["rail"] for r in rows], ["api_x402", "stablecoin"])
+        self.assertEqual({r["x_agent_id"] for r in rows}, {"mapped-bot"})
+        self.assertEqual({r["x_budget_id"] for r in rows}, {"team-mapped"})
 
     def test_gateway_denies_spend_that_would_exceed_budget(self) -> None:
         store = SpendStore()
@@ -759,9 +858,9 @@ class CollectorTest(unittest.TestCase):
         summary = _run_summary(store, alerts, budgets)
         alert = _alert_row(alerts[0])
 
-        self.assertEqual(summary["events"], 15)
-        self.assertEqual(summary["agents"], 3)
-        self.assertEqual(set(summary["rails"]), {"api_x402", "card", "llm_token"})
+        self.assertEqual(summary["events"], 17)
+        self.assertEqual(summary["agents"], 4)
+        self.assertEqual(set(summary["rails"]), {"api_x402", "card", "llm_token", "stablecoin"})
         self.assertEqual(summary["alerts"]["total"], len(alerts))
         self.assertTrue({"kind", "subject", "detail", "severity", "value"} <= set(alert))
 

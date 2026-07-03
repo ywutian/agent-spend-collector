@@ -1,0 +1,14 @@
+{
+  "0xresearchwallet": {
+    "agent_id": "research-bot",
+    "budget_id": "team-research"
+  },
+  "0xsupportwallet": {
+    "agent_id": "support-bot",
+    "budget_id": "team-support"
+  },
+  "0xopswallet": {
+    "agent_id": "ops-bot",
+    "budget_id": "team-ops"
+  }
+}

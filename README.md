@@ -3,7 +3,7 @@
 **See and govern every dollar your AI agents spend, across every rail.**
 
 A free, read-only, cross-rail **agent spend collector**. It pulls what your agents
-spend (LLM token cost + x402 payments + Stripe card payments today; USDC next),
+spend (LLM token cost + x402 payments + direct USDC transfers + Stripe card payments),
 normalizes it into **one [FOCUS](https://focus.finops.org/)-shaped ledger**, and
 flags anomalies: runaway loops, cost spikes, budget burn. **It never touches your
 money** (read-only), so it clears security review on day one.
@@ -36,6 +36,7 @@ public fixtures from `fixtures/`:
 |---|---|
 | `llm_usage.json` | LLM token baseline, runaway token spike, and a new high-spend key |
 | `x402_settlements.json` | Paid API calls settled in USDC on the x402 rail |
+| `usdc_transfers.json` | Direct Base USDC wallet/smart-account payments |
 | `stripe_events.json` | Stripe card payments with agent/budget metadata |
 | `budgets.json` | Team caps used by the budget detectors |
 
@@ -203,13 +204,48 @@ detectors, fixtures, and dashboard rendering.
 
 ## Real data (read-only)
 
+Fastest setup: copy one config, fill the addresses/env-var names you use, then
+pull every configured rail into the same ledger.
+
+```bash
+cp spend.config.example.json spend.config.json
+# edit spend.config.json: receiving addresses, enabled rails, wallet -> agent/budget map
+python3 -m spend_collector pull-all --config spend.config.json
+```
+
+The `wallets` map is what turns chain addresses into useful agent spend:
+
+```json
+{
+  "0xresearchwallet": {
+    "agent_id": "research-bot",
+    "budget_id": "team-research"
+  }
+}
+```
+
+For direct USDC only, use the small form:
+
+```bash
+python3 -m spend_collector pull-usdc \
+  --pay-to 0xYourReceivingAddress \
+  --wallet-map wallet-map.example.json \
+  --db spend.db \
+  --out-dir artifacts
+```
+
+Single-rail pulls still work:
+
 ```bash
 # LLM token cost (admin/usage key, read-only)
 export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
 python3 -m spend_collector pull --db spend.db --days 7 --out-dir artifacts
 
 # x402 payments: USDC settlements into your merchant address on Base
-python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --db spend.db --out-dir artifacts
+python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
+
+# direct USDC payments: Base USDC transfers into your receiving address
+python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
 
 # card payments: Stripe succeeded PaymentIntents (restricted read key)
 export STRIPE_SECRET_KEY=rk_live_...
@@ -235,7 +271,8 @@ Example `budgets.json`:
 
 For production scheduling, artifact retention, and incident handling, see
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md). A safe starting config is provided in
-`.env.example` and `budgets.example.json`.
+`spend.config.example.json`, `wallet-map.example.json`, `.env.example`, and
+`budgets.example.json`.
 
 Or do it all at once: **`scripts/dogfood.sh`** pulls whatever credentials are set
 and opens the dashboard. After any pull, `python3 -m spend_collector report --db
@@ -245,6 +282,7 @@ Attribution:
 
 - LLM: one API key per agent.
 - x402: payer wallet.
+- USDC: payer wallet by default; map wallet addresses to agents/budgets upstream.
 - Stripe: `PaymentIntent.metadata.agent_id` and `metadata.budget_id`.
 
 OpenAI and OpenRouter can follow the Anthropic cost-report shape.
@@ -255,7 +293,7 @@ OpenAI and OpenRouter can follow the Anthropic cost-report shape.
 |---|---|
 | `schema.py` | FOCUS-shaped `SpendEvent` (one row shape for every rail) |
 | `store.py` | Append-only, idempotent SQLite ledger + summaries |
-| `adapters.py` | Normalizers: token usage / x402 settlements / Stripe events -> ledger rows |
+| `adapters.py` | Normalizers: token usage / x402 settlements / USDC transfers / Stripe events -> ledger rows |
 | `sources.py` | Live read-only pulls: Anthropic cost API, Base USDC logs, Stripe Events API |
 | `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
 | `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
@@ -279,9 +317,10 @@ detect -> inline -> on-chain
 1. Done: closed loop on mock data (ingest -> ledger -> detect -> report).
 2. Done: real Anthropic cost pull (`pull`).
 3. Done: real x402 pull, on-chain USDC on Base (`pull-x402`).
-4. Done: Stripe Events rail, token + crypto + card in one ledger (`pull-stripe`).
-5. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-6. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
-7. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
+4. Done: direct USDC stablecoin rail on Base (`pull-usdc`).
+5. Done: Stripe Events rail, token + crypto + card in one ledger (`pull-stripe`).
+6. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
+7. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
+8. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
 Requires Python 3.10+. No dependencies. License: MIT.

@@ -73,7 +73,23 @@ def decode_payment_response(header: str) -> dict:
     return json.loads(base64.b64decode(header))
 
 
-def from_x402_settlements(receipts: list[dict]) -> list[SpendEvent]:
+def _wallet_owner(wallet_map: dict | None, address: str) -> dict:
+    if not wallet_map or not address:
+        return {}
+    value = wallet_map.get(address) or wallet_map.get(address.lower())
+    if isinstance(value, str):
+        return {"agent_id": value}
+    return value if isinstance(value, dict) else {}
+
+
+def _wallet_attribution(row: dict, wallet_map: dict | None) -> tuple[str, str]:
+    owner = _wallet_owner(wallet_map, str(row.get("payer", "")))
+    agent = owner.get("agent_id") or owner.get("x_agent_id") or row.get("agent_id") or row.get("payer") or "unknown"
+    budget = owner.get("budget_id") or owner.get("x_budget_id") or row.get("budget_id") or "default"
+    return str(agent), str(budget)
+
+
+def from_x402_settlements(receipts: list[dict], wallet_map: dict | None = None) -> list[SpendEvent]:
     """x402 payment rail. receipts keys: transaction, amount, asset, network, payer,
     pay_to, resource?, event_time, agent_id, budget_id.
 
@@ -82,6 +98,7 @@ def from_x402_settlements(receipts: list[dict]) -> list[SpendEvent]:
     """
     out = []
     for r in receipts:
+        agent_id, budget_id = _wallet_attribution(r, wallet_map)
         out.append(SpendEvent(
             event_id=f"x402:{r['transaction']}",
             event_time=r["event_time"],
@@ -92,11 +109,51 @@ def from_x402_settlements(receipts: list[dict]) -> list[SpendEvent]:
             billing_currency=r.get("asset", "USDC"),
             consumed_quantity=1,
             pricing_unit="call",
-            x_agent_id=r["agent_id"],
-            x_budget_id=r["budget_id"],
+            x_agent_id=agent_id,
+            x_budget_id=budget_id,
             x_merchant_id=r["pay_to"],
             x_receipt_ref=r["transaction"],
             x_source_event=source_ref("x402", r),
+            charge_category="Purchase",
+        ))
+    return out
+
+
+def from_usdc_transfers(transfers: list[dict], wallet_map: dict | None = None) -> list[SpendEvent]:
+    """Plain USDC/stablecoin rail. transfers keys: transaction, amount, asset,
+    network, payer, pay_to, event_time, agent_id?, budget_id?, merchant_id?,
+    resource?.
+
+    This is for direct wallet or smart-account payments where there is no x402
+    protocol envelope. Attribution defaults to the payer address until callers map
+    wallets to agents/budgets upstream.
+    """
+    out = []
+    for r in transfers:
+        payer = r.get("payer", "")
+        pay_to = r.get("pay_to", "")
+        network = r.get("network", "base")
+        asset = r.get("asset", "USDC")
+        merchant = r.get("merchant_id") or pay_to
+        service = r.get("resource") or r.get("service_name") or f"{asset.lower()}:{network}"
+        tx = r["transaction"]
+        agent_id, budget_id = _wallet_attribution(r, wallet_map)
+        out.append(SpendEvent(
+            event_id=f"usdc:{network}:{tx}",
+            event_time=r["event_time"],
+            rail="stablecoin",
+            provider_name=f"{asset.lower()}:{network}",
+            service_name=service,
+            billed_cost=float(r["amount"]),
+            billing_currency=asset,
+            consumed_quantity=float(r["amount"]),
+            pricing_unit=asset.lower(),
+            x_agent_id=agent_id,
+            x_budget_id=budget_id,
+            x_session_id=r.get("session_id", ""),
+            x_merchant_id=merchant,
+            x_receipt_ref=tx,
+            x_source_event=source_ref(f"{asset.lower()}:{network}", r),
             charge_category="Purchase",
         ))
     return out

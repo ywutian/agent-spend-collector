@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from .adapters import from_llm_usage, from_stripe_events, from_x402_settlements
+from .adapters import from_llm_usage, from_stripe_events, from_usdc_transfers, from_x402_settlements
 from .detectors import run_all
 from .gateway import (
     GuardRequest,
@@ -43,12 +43,58 @@ def _load_json_file(path: str | Path) -> dict:
     return data
 
 
+def _load_config(path: str | Path | None) -> dict:
+    if not path:
+        return {}
+    return _load_json_file(path)
+
+
+def _load_wallet_map(path: str | Path | None = None, config: dict | None = None,
+                     base_dir: str | Path | None = None) -> dict:
+    data: dict = {}
+    config = config or {}
+    def resolve(value: str | Path) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() or base_dir is None else Path(base_dir) / p
+    if path:
+        data = _load_json_file(resolve(path))
+    elif config.get("wallet_map_file"):
+        data = _load_json_file(resolve(config["wallet_map_file"]))
+    elif isinstance(config.get("wallets"), dict):
+        data = config["wallets"]
+    elif isinstance(config.get("wallet_map"), dict):
+        data = config["wallet_map"]
+    if isinstance(data.get("wallets"), dict):
+        data = data["wallets"]
+    return {str(k).lower(): v for k, v in data.items()}
+
+
 def _load_budgets(default: dict[str, float] | None = None) -> dict[str, float]:
     path = os.environ.get("SPEND_BUDGETS_FILE")
     if not path:
         return dict(default or {})
     data = _load_json_file(path)
     return {str(k): float(v) for k, v in data.items()}
+
+
+def _budgets_from_config(config: dict, default: dict[str, float] | None = None) -> dict[str, float]:
+    budgets = config.get("budgets")
+    if isinstance(budgets, dict):
+        return {str(k): float(v) for k, v in budgets.items()}
+    return _load_budgets(default)
+
+
+def _rail_config(config: dict, name: str) -> dict:
+    rails = config.get("rails")
+    if isinstance(rails, dict) and isinstance(rails.get(name), dict):
+        return rails[name]
+    if isinstance(config.get(name), dict):
+        return config[name]
+    return {}
+
+
+def _enabled(cfg: dict, default: bool = True) -> bool:
+    return bool(cfg.get("enabled", default))
 
 
 def _with_stream_usage(raw: bytes) -> bytes:
@@ -166,15 +212,17 @@ def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Pat
 
 
 def demo(out_dir: str | Path = ".") -> None:
-    """Run the product demo: LLM + x402 + Stripe -> ledger -> security signals."""
+    """Run the product demo: LLM + x402 + USDC + Stripe -> ledger -> security signals."""
     llm = _load_fixture("llm_usage.json")
     x402 = _load_fixture("x402_settlements.json")
+    usdc = _load_fixture("usdc_transfers.json")
     stripe = _load_fixture("stripe_events.json")
     budgets = _load_budgets(_load_fixture("budgets.json"))
 
     with SpendStore() as store:
         store.ingest(from_llm_usage(llm))
         store.ingest(from_x402_settlements(x402))
+        store.ingest(from_usdc_transfers(usdc))
         store.ingest(from_stripe_events(stripe))
         _finish_run(store, budgets, out_dir)
 
@@ -188,7 +236,7 @@ def demo(out_dir: str | Path = ".") -> None:
             "new_key_spike",
             "new_merchant_provider",
         }
-        assert 27.10 < store.total() < 27.12, store.total()
+        assert 36.10 < store.total() < 36.12, store.total()
         assert expected <= kinds, kinds
         assert any(a.kind == "spend_spike" and a.subject == "research-bot" for a in alerts), alerts
         assert any(a.kind == "new_key_spike" and a.subject == "new-key-bot" for a in alerts), alerts
@@ -238,7 +286,8 @@ def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int 
 
 
 def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
-              pay_to: str | None = None, lookback_blocks: int = 2000) -> None:
+              pay_to: str | None = None, lookback_blocks: int = 2000,
+              wallet_map_path: str | Path | None = None) -> None:
     """Pull real x402 settlements (USDC into a merchant address on Base, read-only RPC)."""
     from .sources import env_pay_to, fetch_base_usdc_transfers
     pay_to = pay_to or env_pay_to()
@@ -249,9 +298,30 @@ def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
         sys.exit(1)
     with SpendStore(str(db_path)) as store:
         n = store.ingest(from_x402_settlements(
-            fetch_base_usdc_transfers(pay_to, lookback_blocks=lookback_blocks)
+            fetch_base_usdc_transfers(pay_to, lookback_blocks=lookback_blocks),
+            wallet_map=_load_wallet_map(wallet_map_path),
         ))
         print(f"ingested {n} x402 settlements -> {db_path}")
+        _finish_run(store, _load_budgets(), out_dir)
+
+
+def pull_usdc(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
+              pay_to: str | None = None, lookback_blocks: int = 2000,
+              wallet_map_path: str | Path | None = None) -> None:
+    """Pull direct USDC transfers into a wallet on Base (read-only public RPC)."""
+    from .sources import env_usdc_pay_to, fetch_base_usdc_transfers
+    pay_to = pay_to or env_usdc_pay_to()
+    if not pay_to:
+        print("Pass a USDC receiving address on Base:\n"
+              "  USDC_PAY_TO=0x... python3 -m spend_collector pull-usdc\n"
+              "  python3 -m spend_collector pull-usdc --pay-to 0x...")
+        sys.exit(1)
+    with SpendStore(str(db_path)) as store:
+        n = store.ingest(from_usdc_transfers(
+            fetch_base_usdc_transfers(pay_to, lookback_blocks=lookback_blocks),
+            wallet_map=_load_wallet_map(wallet_map_path),
+        ))
+        print(f"ingested {n} USDC transfers -> {db_path}")
         _finish_run(store, _load_budgets(), out_dir)
 
 
@@ -271,6 +341,88 @@ def pull_stripe(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
         _finish_run(store, _load_budgets(), out_dir)
 
 
+def _configured_env(cfg: dict, default_name: str) -> str | None:
+    name = cfg.get("api_key_env") or default_name
+    return os.environ.get(str(name))
+
+
+def pull_all(config_path: str | Path | None = None, db_path: str | Path | None = None,
+             out_dir: str | Path | None = None) -> None:
+    """Pull every configured rail into one ledger, then render once."""
+    from .sources import (
+        env_pay_to, env_usdc_pay_to, fetch_anthropic_cost_report,
+        fetch_base_usdc_transfers, fetch_openai_costs, fetch_stripe_payment_intent_events,
+        from_llm_cost_rows,
+    )
+    config = _load_config(config_path)
+    config_base = Path(config_path).resolve().parent if config_path else None
+    db_path = db_path or config.get("db", "spend.db")
+    out_dir = out_dir or config.get("out_dir", "artifacts")
+    wallet_map = _load_wallet_map(config=config, base_dir=config_base)
+    budgets = _budgets_from_config(config)
+
+    with SpendStore(str(db_path)) as store:
+        llm_cfg = _rail_config(config, "llm") or _rail_config(config, "llm_token")
+        if _enabled(llm_cfg):
+            provider = str(llm_cfg.get("provider", config.get("llm_provider", "anthropic")))
+            days = int(llm_cfg.get("days", config.get("days", 7)))
+            if provider == "openai":
+                key = _configured_env(llm_cfg, "OPENAI_ADMIN_KEY")
+                if key:
+                    n = store.ingest(from_llm_cost_rows(fetch_openai_costs(key, days=days)))
+                    print(f"ingested {n} openai cost rows -> {db_path}")
+                else:
+                    print("skipped llm/openai: set OPENAI_ADMIN_KEY or rails.llm.api_key_env")
+            else:
+                key = _configured_env(llm_cfg, "ANTHROPIC_ADMIN_KEY")
+                if key:
+                    n = store.ingest(from_llm_cost_rows(fetch_anthropic_cost_report(key, days=days)))
+                    print(f"ingested {n} anthropic cost rows -> {db_path}")
+                else:
+                    print("skipped llm/anthropic: set ANTHROPIC_ADMIN_KEY or rails.llm.api_key_env")
+
+        x402_cfg = _rail_config(config, "x402")
+        if _enabled(x402_cfg):
+            pay_to = x402_cfg.get("pay_to") or env_pay_to()
+            if pay_to:
+                rows = fetch_base_usdc_transfers(
+                    str(pay_to),
+                    lookback_blocks=int(x402_cfg.get("lookback_blocks", config.get("lookback_blocks", 2000))),
+                )
+                n = store.ingest(from_x402_settlements(rows, wallet_map=wallet_map))
+                print(f"ingested {n} x402 settlements -> {db_path}")
+            else:
+                print("skipped x402: set rails.x402.pay_to or X402_PAY_TO")
+
+        usdc_cfg = _rail_config(config, "usdc") or _rail_config(config, "stablecoin")
+        if _enabled(usdc_cfg):
+            pay_to = usdc_cfg.get("pay_to") or env_usdc_pay_to()
+            if pay_to:
+                rows = fetch_base_usdc_transfers(
+                    str(pay_to),
+                    lookback_blocks=int(usdc_cfg.get("lookback_blocks", config.get("lookback_blocks", 2000))),
+                )
+                n = store.ingest(from_usdc_transfers(rows, wallet_map=wallet_map))
+                print(f"ingested {n} USDC transfers -> {db_path}")
+            else:
+                print("skipped usdc: set rails.usdc.pay_to, USDC_PAY_TO, or X402_PAY_TO")
+
+        stripe_cfg = _rail_config(config, "stripe") or _rail_config(config, "card")
+        if _enabled(stripe_cfg):
+            key = _configured_env(stripe_cfg, "STRIPE_SECRET_KEY")
+            if key:
+                n = store.ingest(from_stripe_events(fetch_stripe_payment_intent_events(
+                    key,
+                    days=int(stripe_cfg.get("days", config.get("days", 7))),
+                    limit=int(stripe_cfg.get("limit", 100)),
+                )))
+                print(f"ingested {n} Stripe payments -> {db_path}")
+            else:
+                print("skipped stripe: set STRIPE_SECRET_KEY or rails.stripe.api_key_env")
+
+        _finish_run(store, budgets, out_dir)
+
+
 def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
     """Regenerate report.html from an existing SQLite ledger."""
     if not Path(db_path).exists():
@@ -278,7 +430,7 @@ def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
         sys.exit(1)
     with SpendStore(str(db_path)) as store:
         if store.total() == 0:
-            print(f"{db_path} is empty -- run a pull first (pull / pull-x402 / pull-stripe).")
+            print(f"{db_path} is empty -- run a pull first (pull / pull-x402 / pull-usdc / pull-stripe).")
             sys.exit(1)
         print(f"loaded ledger {db_path}")
         _finish_run(store, _load_budgets(), out_dir)
@@ -686,11 +838,25 @@ def _parser() -> argparse.ArgumentParser:
     pull_p.add_argument("--provider", default="anthropic", choices=["anthropic", "openai"],
                         help="LLM cost provider")
 
+    all_p = sub.add_parser("pull-all", parents=[common],
+                           help="pull every configured rail from one JSON config")
+    all_p.add_argument("--config", default="spend.config.json",
+                       help="collector config path; defaults to spend.config.json")
+    all_p.add_argument("--db", help="override SQLite ledger path from config")
+
     x402_p = sub.add_parser("pull-x402", parents=[common],
                             help="pull Base USDC settlements into an x402 address")
     x402_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
     x402_p.add_argument("--pay-to", help="merchant receiving address; defaults to X402_PAY_TO")
     x402_p.add_argument("--lookback-blocks", type=int, default=2000, help="Base blocks to scan")
+    x402_p.add_argument("--wallet-map", help="JSON wallet address -> agent/budget map")
+
+    usdc_p = sub.add_parser("pull-usdc", parents=[common],
+                            help="pull direct Base USDC transfers into an address")
+    usdc_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    usdc_p.add_argument("--pay-to", help="receiving address; defaults to USDC_PAY_TO or X402_PAY_TO")
+    usdc_p.add_argument("--lookback-blocks", type=int, default=2000, help="Base blocks to scan")
+    usdc_p.add_argument("--wallet-map", help="JSON wallet address -> agent/budget map")
 
     stripe_p = sub.add_parser("pull-stripe", parents=[common],
                               help="pull Stripe succeeded PaymentIntent events")
@@ -706,7 +872,7 @@ def _parser() -> argparse.ArgumentParser:
     guard_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
     guard_p.add_argument("--policy", help="gateway policy JSON; defaults to SPEND_POLICY_FILE")
     guard_p.add_argument("--agent", required=True, help="agent id asking to spend")
-    guard_p.add_argument("--rail", required=True, help="rail, e.g. llm_token, api_x402, card")
+    guard_p.add_argument("--rail", required=True, help="rail, e.g. llm_token, api_x402, stablecoin, card")
     guard_p.add_argument("--amount", type=float, required=True, help="requested spend amount")
     guard_p.add_argument("--budget", required=True, help="budget id")
     guard_p.add_argument("--provider", help="provider, e.g. openai, x402, stripe")
@@ -745,8 +911,12 @@ def main(argv: list[str] | None = None) -> None:
         demo(args.out_dir)
     elif cmd == "pull":
         pull(args.db, args.out_dir, args.days, args.provider)
+    elif cmd == "pull-all":
+        pull_all(args.config, args.db, args.out_dir)
     elif cmd == "pull-x402":
-        pull_x402(args.db, args.out_dir, args.pay_to, args.lookback_blocks)
+        pull_x402(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map)
+    elif cmd == "pull-usdc":
+        pull_usdc(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map)
     elif cmd == "pull-stripe":
         pull_stripe(args.db, args.out_dir, args.days, args.limit)
     elif cmd == "report":
