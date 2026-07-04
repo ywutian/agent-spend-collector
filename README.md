@@ -410,6 +410,27 @@ detect -> inline -> on-chain
 10. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
 11. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
+## Open source, and what's commercial
+
+Everything in this repository is **MIT-licensed and free** — the read-only
+cross-rail collector, pricing and detectors, the local dashboard, and the
+self-hosted pre-spend gateway (policy, allow/deny, record, reserve/release,
+velocity caps, multi-platform alerts, opt-in AI triage). Self-hosted, single-node,
+single-tenant. Yours to run and extend.
+
+What is **not** here — and is a separate commercial product — is the enterprise
+control plane around it: SSO / RBAC / multi-tenancy, managed HA and a hosted data
+layer, SOC 2 / immutable audit / approval workflows, SIEM & ITSM integrations, a
+policy-management UI with simulation, and role-scoped chargeback reporting. The
+open-source engine detects and enforces on one node; the control plane is what
+makes it a governed platform for an org.
+
+The line is deliberate: the collector should be trivially adoptable and never hold
+your governance hostage, while the operational substrate an enterprise pays for
+stays a product, not a feature.
+
+## License & requirements
+
 Requires Python 3.10+. No required dependencies; optional `tokencost`
 (`pip install spend-collector[pricing]`) for accurate pricing across 400+ models,
 otherwise a small built-in price book. License: MIT.
