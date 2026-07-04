@@ -345,16 +345,22 @@ def _format_alert(platform: str, text: str, structured: dict) -> dict:
 def _triage_alerts(alerts: list, summary: dict) -> str | None:
     """Opt-in AI triage: ask an LLM for the likely cause + one recommended action for
     the high-severity alerts. Enabled by SPEND_TRIAGE_MODEL; uses an OpenAI-compatible
-    endpoint (SPEND_TRIAGE_BASE_URL, default OpenAI) with SPEND_TRIAGE_API_KEY or
-    OPENAI_API_KEY. Point the base URL at your own gateway to route (and record) the
-    triage call itself. Sends only alert metadata; best-effort, None on any failure.
+    endpoint (SPEND_TRIAGE_BASE_URL, default OpenAI). For the default OpenAI URL it
+    uses SPEND_TRIAGE_API_KEY or OPENAI_API_KEY. If the base URL points at a local
+    gateway, it uses SPEND_TRIAGE_API_KEY or SPEND_GATEWAY_TOKEN instead. Sends only
+    alert metadata; best-effort, None on any failure.
     """
     model = os.environ.get("SPEND_TRIAGE_MODEL")
-    key = os.environ.get("SPEND_TRIAGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
     high = [a for a in alerts if a.severity == "high"]
+    base = os.environ.get("SPEND_TRIAGE_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    host = (urllib.parse.urlsplit(base).hostname or "").lower()
+    local_gateway = host in {"127.0.0.1", "localhost", "::1"}
+    key = (
+        os.environ.get("SPEND_TRIAGE_API_KEY")
+        or (os.environ.get("SPEND_GATEWAY_TOKEN") if local_gateway else os.environ.get("OPENAI_API_KEY"))
+    )
     if not model or not key or not high:
         return None
-    base = os.environ.get("SPEND_TRIAGE_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     facts = {"alerts": [_alert_row(a) for a in high],
              "total_spend": summary.get("total_spend"), "budgets": summary.get("budgets")}
     body = {

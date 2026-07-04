@@ -1539,13 +1539,42 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(_format_alert("generic", "hi", s), s)
 
     def test_triage_is_opt_in(self) -> None:
-        os.environ.pop("SPEND_TRIAGE_MODEL", None)
+        old_env = {
+            key: os.environ.get(key)
+            for key in (
+                "SPEND_TRIAGE_MODEL",
+                "SPEND_TRIAGE_BASE_URL",
+                "SPEND_TRIAGE_API_KEY",
+                "SPEND_GATEWAY_TOKEN",
+                "OPENAI_API_KEY",
+            )
+        }
+        for key in old_env:
+            os.environ.pop(key, None)
+
+        def restore_env():
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore_env)
         highs = [Alert("spend_spike", "bot", "big", "high", 9.9)]
         self.assertIsNone(_triage_alerts(highs, {}))  # no SPEND_TRIAGE_MODEL -> off
         os.environ["SPEND_TRIAGE_MODEL"] = "gpt-4o-mini"
-        self.addCleanup(lambda: os.environ.pop("SPEND_TRIAGE_MODEL", None))
         warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
         self.assertIsNone(_triage_alerts(warns, {}))  # enabled but no high alert -> no call
+        os.environ["OPENAI_API_KEY"] = "sk-provider-key"
+        os.environ["SPEND_TRIAGE_BASE_URL"] = "http://127.0.0.1:8788/openai/v1"
+        original_urlopen = urllib.request.urlopen
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("local gateway triage must not use OPENAI_API_KEY as its token")
+
+        urllib.request.urlopen = fail_if_called
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", original_urlopen))
+        self.assertIsNone(_triage_alerts(highs, {}))  # no gateway token -> no outbound call
 
     def test_alert_payload_only_for_high_severity(self) -> None:
         warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
