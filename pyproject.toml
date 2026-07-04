@@ -1,6 +1,6 @@
 [project]
 name = "spend-collector"
-version = "0.0.1"
+version = "0.1.0"
 description = "Read-only cross-rail agent spend collector (LLM token + x402 + Stripe -> one FOCUS-shaped ledger)"
 readme = "README.md"
 license = "MIT"
