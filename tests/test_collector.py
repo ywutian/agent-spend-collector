@@ -897,6 +897,20 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(event.service_name, "gemini-2.5-flash")
         self.assertGreater(event.billed_cost, 0)
 
+    def test_gateway_records_cohere_usage_shape(self) -> None:
+        # Cohere: meta.billed_units.{input_tokens,output_tokens}; model from the request
+        raw = json.dumps({
+            "id": "c1", "meta": {"billed_units": {"input_tokens": 1000, "output_tokens": 500}},
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, {"provider": "cohere"},
+                                       {"agent": "advisor-bot", "budget": "team-edu", "service": "command-r-plus"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertEqual(event.service_name, "command-r-plus")
+        self.assertGreater(event.billed_cost, 0)
+
     def test_tokencost_optional_pricing_fallback(self) -> None:
         try:
             import tokencost  # noqa: F401
