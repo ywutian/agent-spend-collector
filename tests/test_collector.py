@@ -16,8 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from spend_collector.__main__ import (
-    _alert_payload, _alert_row, _is_event_stream, _load_budgets, _run_summary,
-    _usage_body_from_sse, _with_stream_usage, main, make_gateway_server,
+    _alert_payload, _alert_platform, _alert_row, _format_alert, _is_event_stream,
+    _load_budgets, _run_summary, _triage_alerts, _usage_body_from_sse, _with_stream_usage,
+    main, make_gateway_server,
 )
 from spend_collector.adapters import (
     _price, _tokencost_price, from_llm_usage, from_stripe_events,
@@ -1488,6 +1489,29 @@ class CollectorTest(unittest.TestCase):
         deny = decide(store, policy, GuardRequest(x_agent_id="bot", rail="llm_token", amount=2.0, x_budget_id="team-x"))
         self.assertEqual(deny.decision, "deny")     # 4 + 2 > 5
         self.assertTrue(any("hourly rate" in r for r in deny.reasons))
+
+    def test_alert_multi_platform_formatting(self) -> None:
+        os.environ.pop("SPEND_ALERT_FORMAT", None)
+        self.assertEqual(_alert_platform("https://hooks.slack.com/services/x"), "slack")
+        self.assertEqual(_alert_platform("https://discord.com/api/webhooks/x"), "discord")
+        self.assertEqual(_alert_platform("https://open.feishu.cn/open-apis/bot/v2/hook/x"), "feishu")
+        self.assertEqual(_alert_platform("https://acme.webhook.office.com/x"), "teams")
+        self.assertEqual(_alert_platform("https://my-own.example/hook"), "generic")
+        s = {"text": "hi", "alerts": [], "summary": {}}
+        self.assertEqual(_format_alert("slack", "hi", s), {"text": "hi"})
+        self.assertEqual(_format_alert("discord", "hi", s), {"content": "hi"})
+        self.assertEqual(_format_alert("feishu", "hi", s)["msg_type"], "text")
+        self.assertEqual(_format_alert("teams", "hi", s)["@type"], "MessageCard")
+        self.assertEqual(_format_alert("generic", "hi", s), s)
+
+    def test_triage_is_opt_in(self) -> None:
+        os.environ.pop("SPEND_TRIAGE_MODEL", None)
+        highs = [Alert("spend_spike", "bot", "big", "high", 9.9)]
+        self.assertIsNone(_triage_alerts(highs, {}))  # no SPEND_TRIAGE_MODEL -> off
+        os.environ["SPEND_TRIAGE_MODEL"] = "gpt-4o-mini"
+        self.addCleanup(lambda: os.environ.pop("SPEND_TRIAGE_MODEL", None))
+        warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
+        self.assertIsNone(_triage_alerts(warns, {}))  # enabled but no high alert -> no call
 
     def test_alert_payload_only_for_high_severity(self) -> None:
         warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
