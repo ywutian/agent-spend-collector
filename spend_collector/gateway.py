@@ -287,14 +287,16 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         data = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    usage = (data.get("usage") if isinstance(data, dict) else None) or {}
+    # OpenAI/compat: "usage". Gemini native: "usageMetadata".
+    usage = (data.get("usage") or data.get("usageMetadata") if isinstance(data, dict) else None) or {}
     if not usage:
         return None
     pname = str(provider.get("provider", "openai"))
-    model = str(data.get("model") or guard_payload.get("service") or pname)
-    # OpenAI: prompt_tokens/completion_tokens. Anthropic: input_tokens/output_tokens.
-    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-    completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    model = str(data.get("model") or data.get("modelVersion") or guard_payload.get("service") or pname)
+    # OpenAI: prompt_tokens/completion_tokens. Anthropic: input_/output_tokens.
+    # Gemini: promptTokenCount/candidatesTokenCount.
+    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", usage.get("promptTokenCount", 0))) or 0)
+    completion = int(usage.get("completion_tokens", usage.get("output_tokens", usage.get("candidatesTokenCount", 0))) or 0)
     rid = str(data.get("id") or f"{guard_payload.get('agent', 'agent')}:{prompt}:{completion}")
     event = SpendEvent(
         event_id=f"gw:{rid}",

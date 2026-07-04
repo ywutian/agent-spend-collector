@@ -33,6 +33,26 @@
       "service_from_body": "model",
       "amount": 0.25,
       "budget": "team-research"
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "rail": "llm_token",
+      "provider": "openrouter",
+      "merchant": "openrouter",
+      "service_from_body": "model",
+      "amount": 0.25,
+      "budget": "team-research"
+    },
+    "groq": {
+      "base_url": "https://api.groq.com/openai",
+      "api_key_env": "GROQ_API_KEY",
+      "rail": "llm_token",
+      "provider": "groq",
+      "merchant": "groq",
+      "service_from_body": "model",
+      "amount": 0.25,
+      "budget": "team-research"
     }
   },
   "targets": {

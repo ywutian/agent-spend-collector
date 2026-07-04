@@ -18,7 +18,9 @@ from spend_collector.__main__ import (
     _alert_row, _is_event_stream, _load_budgets, _run_summary, _usage_body_from_sse,
     _with_stream_usage, main, make_gateway_server,
 )
-from spend_collector.adapters import _price, from_llm_usage, from_stripe_events, from_x402_settlements
+from spend_collector.adapters import (
+    _price, _tokencost_price, from_llm_usage, from_stripe_events, from_x402_settlements,
+)
 from spend_collector.detectors import run_all
 from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
 from spend_collector.report import _money, render
@@ -879,6 +881,34 @@ class CollectorTest(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event.consumed_quantity, 1500)
         self.assertGreater(event.billed_cost, 0)  # claude-opus-4-8 is priced
+
+    def test_gateway_records_gemini_usage_shape(self) -> None:
+        # Gemini native: usageMetadata.promptTokenCount / candidatesTokenCount, modelVersion
+        raw = json.dumps({
+            "modelVersion": "gemini-2.5-flash",
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 500},
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, {"provider": "gemini"},
+                                       {"agent": "advisor-bot", "budget": "team-edu"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertEqual(event.service_name, "gemini-2.5-flash")
+        self.assertGreater(event.billed_cost, 0)
+
+    def test_tokencost_optional_pricing_fallback(self) -> None:
+        try:
+            import tokencost  # noqa: F401
+            has_tc = True
+        except ImportError:
+            has_tc = False
+        if not has_tc:  # no dependency -> None, and _price still works via static book
+            self.assertIsNone(_tokencost_price("gpt-4o-mini", 1000, 500))
+        # tokencost and the static book agree here, so this is deterministic either way
+        self.assertAlmostEqual(_price("gpt-4o-mini", 1000, 500), 0.00045)
+        self.assertGreater(_price("gemini-2.5-flash", 1000, 500), 0)  # added to fallback
+        self.assertEqual(_price("totally-unknown-xyz", 1000, 500), 0.0)  # never crashes
 
     def test_gateway_records_streamed_spend(self) -> None:
         # stream:true -> gateway asks the provider for a final usage chunk

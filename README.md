@@ -190,7 +190,7 @@ block the spend when the decision is `deny`.
 
 ## Verify locally
 
-The project is stdlib-only. Run the test suite and product demo with:
+The project needs no required dependencies. Run the test suite and product demo with:
 
 ```bash
 python3 -m unittest discover -s tests
@@ -249,6 +249,28 @@ Attribution:
 
 OpenAI and OpenRouter can follow the Anthropic cost-report shape.
 
+## Providers and pricing
+
+**Gateway forwarding is provider-agnostic for OpenAI-compatible endpoints.** Most
+vendors expose one (OpenAI, Anthropic, Gemini, xAI, Mistral, DeepSeek, Groq,
+OpenRouter, Perplexity, Together, Fireworks, Azure OpenAI). Add a provider to the
+policy — no code — and route to it at `/<provider>/v1/...`:
+
+```json
+"providers": {
+  "groq": {"base_url": "https://api.groq.com/openai", "api_key_env": "GROQ_API_KEY",
+           "rail": "llm_token", "service_from_body": "model", "amount": 0.25, "budget": "team"}
+}
+```
+
+`gateway.example.json` ships `openai`, `openrouter`, and `groq` entries. Recording
+reads token usage in OpenAI (`prompt_tokens`/`completion_tokens`), Anthropic
+(`input_tokens`/`output_tokens`), and Gemini (`usageMetadata`) shapes.
+
+**Pricing:** install `tokencost` (`pip install spend-collector[pricing]`) for
+accurate, maintained rates across 400+ models. Without it, a small built-in price
+book covers common models and everything else prices at zero until added.
+
 ## What's inside
 
 | File | Role |
@@ -284,4 +306,6 @@ detect -> inline -> on-chain
 6. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
 7. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
-Requires Python 3.10+. No dependencies. License: MIT.
+Requires Python 3.10+. No required dependencies; optional `tokencost`
+(`pip install spend-collector[pricing]`) for accurate pricing across 400+ models,
+otherwise a small built-in price book. License: MIT.

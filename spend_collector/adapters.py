@@ -12,23 +12,53 @@ from datetime import datetime, timezone
 
 from .schema import SpendEvent, source_ref
 
-# ponytail: small static price book (approximate USD per 1M tokens: input, output).
-# Approximate list prices; swap for `tokencost` (MIT, 400+ models) for accuracy/coverage.
+# Zero-dependency fallback price book (approximate USD per 1M tokens: input, output).
+# When the optional `tokencost` package (MIT, 400+ models) is installed, _price()
+# uses it for accurate, maintained pricing and this table is only the fallback.
 _PRICES = {
     "gpt-5": (1.25, 10.0),
+    "gpt-4.1": (2.0, 8.0),
+    "gpt-4.1-mini": (0.4, 1.6),
     "gpt-4o-mini": (0.15, 0.6),
     "gpt-4o": (2.5, 10.0),
     "gpt-4-turbo": (10.0, 30.0),
     "gpt-3.5-turbo": (0.5, 1.5),
+    "o3-mini": (1.1, 4.4),
     "o1": (15.0, 60.0),
+    "deepseek-reasoner": (0.55, 2.19),
     "deepseek-chat": (0.27, 1.1),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-sonnet-5": (3.0, 15.0),
     "claude-haiku-4-5": (0.8, 4.0),
+    "gemini-2.5-pro": (1.25, 10.0),
+    "gemini-2.5-flash": (0.3, 2.5),
+    "grok-4": (3.0, 15.0),
+    "mistral-large": (2.0, 6.0),
+    "command-r-plus": (2.5, 10.0),
 }
 
 
+def _tokencost_price(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Accurate per-model cost via the optional `tokencost` package (400+ models).
+    Returns None when tokencost is not installed or does not know the model, so the
+    static fallback still applies. No hard dependency.
+    """
+    try:
+        from tokencost import calculate_cost_by_tokens
+    except ImportError:
+        return None
+    try:
+        inp = calculate_cost_by_tokens(int(input_tokens), model, "input")
+        out = calculate_cost_by_tokens(int(output_tokens), model, "output")
+        return float(inp + out)
+    except Exception:  # unknown model / API change -> fall back to the static table
+        return None
+
+
 def _price(model: str, input_tokens: int, output_tokens: int) -> float:
+    cost = _tokencost_price(model, input_tokens, output_tokens)
+    if cost is not None:
+        return cost
     pin, pout = _PRICES.get(model, (0.0, 0.0))
     if (pin, pout) == (0.0, 0.0):  # dated ids like gpt-4o-2024-08-06 -> longest-prefix match
         for key in sorted(_PRICES, key=len, reverse=True):
