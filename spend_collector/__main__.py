@@ -154,16 +154,54 @@ def _alert_payload(alerts: list, summary: dict) -> dict | None:
             "alerts": [_alert_row(a) for a in high], "summary": summary}
 
 
+_ALERT_HOSTS = (  # webhook host substring -> platform envelope
+    ("hooks.slack.com", "slack"),
+    ("discord", "discord"),
+    ("feishu", "feishu"), ("larksuite", "feishu"), ("larkoffice", "feishu"),
+    ("office.com", "teams"),
+)
+
+
+def _alert_platform(url: str) -> str:
+    """Notification platform for a webhook URL. SPEND_ALERT_FORMAT overrides; else
+    auto-detect from the host; else a generic JSON POST.
+    """
+    override = os.environ.get("SPEND_ALERT_FORMAT", "").strip().lower()
+    if override:
+        return override
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    for needle, platform in _ALERT_HOSTS:
+        if needle in host:
+            return platform
+    return "generic"
+
+
+def _format_alert(platform: str, text: str, structured: dict) -> dict:
+    """Wrap the alert text in each platform's expected envelope."""
+    if platform == "slack":
+        return {"text": text}
+    if platform == "discord":
+        return {"content": text[:1900]}  # Discord caps content at 2000 chars
+    if platform == "feishu":  # Feishu / Lark
+        return {"msg_type": "text", "content": {"text": text}}
+    if platform == "teams":
+        return {"@type": "MessageCard", "@context": "http://schema.org/extensions",
+                "title": "agent-spend alerts", "text": text}
+    return structured  # generic: full {text, alerts, summary}
+
+
 def _notify_alerts(alerts: list, summary: dict) -> bool:
-    """POST high-severity alerts to SPEND_ALERT_WEBHOOK (opt-in, Slack-compatible).
-    Best-effort: sends only alert metadata (no prompts/keys) and never breaks a run.
+    """POST high-severity alerts to SPEND_ALERT_WEBHOOK (opt-in). Formats for Slack,
+    Discord, Feishu/Lark, Teams, or a generic JSON body (auto-detected from the URL,
+    or SPEND_ALERT_FORMAT). Best-effort: metadata only, never breaks a run.
     """
     url = os.environ.get("SPEND_ALERT_WEBHOOK")
     payload = _alert_payload(alerts, summary)
     if not url or payload is None:
         return False
+    body = _format_alert(_alert_platform(url), payload["text"], payload)
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(),
+        url, data=json.dumps(body).encode(),
         headers={"content-type": "application/json"}, method="POST",
     )
     try:

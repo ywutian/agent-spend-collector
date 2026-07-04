@@ -177,9 +177,12 @@ When `report.html` shows high severity alerts:
 
 `run-summary.json` is intended for job runners and alert routing. It contains
 total spend, event count, distinct agents, rails, configured budgets, and counts
-of high/warn alerts. Set `SPEND_ALERT_WEBHOOK` to auto-POST high-severity alerts
-(Slack-compatible JSON, metadata only — no prompts or keys) on every run, or a cron
-wrapper can page when `alerts.high > 0`.
+of high/warn alerts. Set `SPEND_ALERT_WEBHOOK` to auto-POST high-severity alerts on
+every run (metadata only — no prompts or keys). The body is formatted for **Slack,
+Discord, Feishu/Lark, or Teams**, auto-detected from the webhook host; set
+`SPEND_ALERT_FORMAT` to force one (`slack`/`discord`/`feishu`/`teams`/`generic`), or
+`generic` posts the full `{text, alerts, summary}` JSON. Or a cron wrapper can page
+when `alerts.high > 0`.
 
 To slow a runaway loop before it drains the whole budget, add a velocity cap to the
 policy: `max_amount_per_hour` — a per-budget map (`{"team-research": 5.0}`) or a bare
