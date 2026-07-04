@@ -19,6 +19,7 @@ from .gateway import (
     audit_config as build_audit_config,
     cap_for_request,
     decide,
+    inspect_content,
     record_forwarded_spend,
     record_target_spend,
     require_valid_policy,
@@ -1019,6 +1020,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 provider_route = self._provider_route(policy)
                 if provider_route:
                     provider_id, provider, suffix = provider_route
+                    content_reasons = inspect_content(getattr(self, "_raw_body", b""), policy)
+                    if content_reasons:  # block on request content before policy/reservation
+                        self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                        return
                     guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
                     decision = self._guard_payload(guard_payload, route_type="provider", route_id=provider_id)
                     if not decision["allowed"]:

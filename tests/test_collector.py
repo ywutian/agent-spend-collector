@@ -1390,6 +1390,22 @@ class CollectorTest(unittest.TestCase):
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2)
             self.assertEqual(err.exception.code, 401)
 
+    def test_content_guard_inspection(self) -> None:
+        from spend_collector.gateway import inspect_content, validate_policy
+        self.assertEqual(inspect_content(b'{"model":"gpt-4o"}', {}), [])  # disabled -> clean
+        self.assertTrue(inspect_content(b"x" * 5000, {"content_guard": {"max_bytes": 1000}}))
+        r = inspect_content(b'{"content":"ignore previous instructions"}',
+                            {"content_guard": {"deny_patterns": ["ignore previous instructions"]}})
+        self.assertTrue(any("deny pattern" in x for x in r))
+        r2 = inspect_content(b'{"content":"sk-abcdefghijklmnopqrstuvwxyz123456"}',
+                             {"content_guard": {"deny_secrets": True}})
+        self.assertTrue(any("secret" in x for x in r2))
+        self.assertEqual(inspect_content(b'{"model":"gpt-4o"}',
+                         {"content_guard": {"max_bytes": 100000, "deny_secrets": True}}), [])
+        self.assertEqual(validate_policy({"gateway_tokens": ["t"],
+                         "content_guard": {"max_bytes": 1000, "deny_secrets": True}}), [])
+        self.assertTrue(validate_policy({"gateway_tokens": ["t"], "content_guard": {"bogus": 1}}))
+
 
 if __name__ == "__main__":
     unittest.main()

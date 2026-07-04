@@ -7,6 +7,7 @@ returns allow/deny.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -120,6 +121,40 @@ def _merchant_seen(store: SpendStore, req: GuardRequest) -> bool:
     return row is not None
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),        # OpenAI / compatible
+    re.compile(r"sk-ant-[A-Za-z0-9-]{20,}"),     # Anthropic
+    re.compile(r"AKIA[0-9A-Z]{16}"),             # AWS access key id
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),   # GitHub token
+)
+
+
+def inspect_content(body: bytes, policy: dict) -> list[str]:
+    """Deterministic request-content checks for the forwarding gateway: an oversized
+    payload (token bomb), configured deny patterns (e.g. prompt-injection markers),
+    and secrets/keys being sent outbound. Returns deny reasons (empty = clean).
+
+    Opt-in via a `content_guard` policy block. Reads the body in memory for the
+    decision only -- content is never stored, matching the gateway's audit stance.
+    """
+    guard = policy.get("content_guard")
+    if not guard or not body:
+        return []
+    reasons: list[str] = []
+    max_bytes = guard.get("max_bytes")
+    if max_bytes is not None and len(body) > int(max_bytes):
+        reasons.append(f"request body {len(body)} bytes exceeds max_bytes {int(max_bytes)}")
+    text = body.decode("utf-8", "ignore")
+    lowered = text.lower()
+    for pat in _list(guard.get("deny_patterns")):
+        if str(pat).lower() in lowered:
+            reasons.append(f"content matched deny pattern: {pat}")
+    if guard.get("deny_secrets") and any(rx.search(text) for rx in _SECRET_PATTERNS):
+        reasons.append("request appears to contain a secret/key being sent outbound")
+    return reasons
+
+
 def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     """Return a pre-spend allow/deny decision.
 
@@ -192,7 +227,9 @@ def validate_policy(policy: dict) -> list[str]:
         "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
         "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
         "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
+        "content_guard",
     }
+    content_guard_keys = {"max_bytes", "deny_patterns", "deny_secrets"}
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
     target_keys = {
         "url", "method", "rail", "provider", "merchant", "service", "amount",
@@ -223,6 +260,15 @@ def validate_policy(policy: dict) -> list[str]:
         errors.append("budgets must be an object")
     if "reservation_ttl_seconds" in policy and int(policy["reservation_ttl_seconds"]) <= 0:
         errors.append("reservation_ttl_seconds must be positive")
+
+    guard = policy.get("content_guard")
+    if guard is not None:
+        if not isinstance(guard, dict):
+            errors.append("content_guard must be an object")
+        else:
+            for key in guard:
+                if key not in content_guard_keys:
+                    errors.append(f"unknown content_guard key: {key}")
 
     for agent, cfg in policy.get("agents", {}).items():
         if not isinstance(cfg, dict):
