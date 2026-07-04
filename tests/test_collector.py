@@ -975,11 +975,16 @@ class CollectorTest(unittest.TestCase):
     def test_provider_gateway_streams_sse_without_logging_body(self) -> None:
         class StreamProvider(BaseHTTPRequestHandler):
             def do_POST(self):
+                length = int(self.headers.get("content-length", 0) or 0)
+                if length:  # drain the request body, else an unread body can RST the socket
+                    self.rfile.read(length)
                 out = b"data: one\n\ndata: [DONE]\n\n"
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(out)))
                 self.end_headers()
                 self.wfile.write(out)
+                self.wfile.flush()
 
             def log_message(self, fmt, *args):
                 return
