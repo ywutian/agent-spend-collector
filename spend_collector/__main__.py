@@ -19,6 +19,7 @@ from .gateway import (
     audit_config as build_audit_config,
     cap_for_request,
     decide,
+    inspect_content,
     record_forwarded_spend,
     record_target_spend,
     rate_cap_for_request,
@@ -983,6 +984,16 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             self._raw_body = self.rfile.read(length)
             return self._raw_body
 
+        def _target_body_bytes(self, payload: dict) -> bytes:
+            body = payload.get("body", b"")
+            if isinstance(body, (dict, list)):
+                return json.dumps(body).encode()
+            if isinstance(body, str):
+                return body.encode()
+            if body is None:
+                return b""
+            return body
+
         def _authorized(self, policy: dict, token: str = "") -> bool:
             tokens = policy.get("gateway_tokens")
             env_token = os.environ.get("SPEND_GATEWAY_TOKEN")
@@ -1122,6 +1133,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 return False
             resource_id, resource = route
             body = self._read_raw()
+            content_reasons = inspect_content(body, policy)
+            if content_reasons:
+                self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                return True
             requirements = _x402_payment_requirements(resource)
             guard_payload = self._x402_guard_payload(resource_id, resource)
             payment_header = self.headers.get("payment-signature") or self.headers.get("x-payment")
@@ -1231,12 +1246,12 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             }
             body = payload.get("body", b"")
             if isinstance(body, (dict, list)):
-                body = json.dumps(body).encode()
+                body = self._target_body_bytes(payload)
                 headers.setdefault("content-type", "application/json")
             elif isinstance(body, str):
-                body = body.encode()
+                body = self._target_body_bytes(payload)
             elif body is None:
-                body = b""
+                body = self._target_body_bytes(payload)
             method = str(target.get("method", "POST")).upper()
             req = urllib.request.Request(str(target["url"]), data=body, headers=headers, method=method)
             try:
@@ -1371,6 +1386,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     target, guard_payload = self._target_request(payload, policy)
                     if "request_id" in payload:
                         guard_payload["request_id"] = payload["request_id"]
+                    content_reasons = inspect_content(self._target_body_bytes(payload), policy)
+                    if content_reasons:
+                        self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                        return
                     decision = self._guard_payload(guard_payload, route_type="target", route_id=str(payload["target"]))
                     if not decision["allowed"]:
                         self._send(403, decision)
@@ -1380,6 +1399,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 provider_route = self._provider_route(policy)
                 if provider_route:
                     provider_id, provider, suffix = provider_route
+                    content_reasons = inspect_content(getattr(self, "_raw_body", b""), policy)
+                    if content_reasons:  # block on request content before policy/reservation
+                        self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                        return
                     guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
                     decision = self._guard_payload(guard_payload, route_type="provider", route_id=provider_id)
                     if not decision["allowed"]:

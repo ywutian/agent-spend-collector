@@ -207,3 +207,11 @@ To slow a runaway loop before it drains the whole budget, add a velocity cap to 
 policy: `max_amount_per_hour` — a per-budget map (`{"team-research": 5.0}`) or a bare
 number for all budgets — denies once the last hour's spend for that budget would
 exceed it.
+
+The forwarding gateway can also inspect request **content** before spending. Add a
+`content_guard` block to the policy: `max_bytes` (reject oversized payloads — token
+bombs), `deny_patterns` (a list of substrings to block, e.g. prompt-injection
+markers), and `deny_secrets: true` (block a request that appears to carry an API key
+or private key outbound). It reads the body in memory for the decision only — content
+is never stored. Deterministic checks only; deep threat analysis is out of scope for
+the open-source gateway.

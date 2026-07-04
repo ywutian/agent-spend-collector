@@ -377,6 +377,7 @@ class CollectorTest(unittest.TestCase):
             policy = {
                 "max_amount": 1.0,
                 "gateway_tokens": ["test-gateway-token"],
+                "content_guard": {"deny_patterns": ["ignore previous instructions"]},
                 "targets": {
                     "ok": {
                         "url": f"http://127.0.0.1:{upstream.server_port}/ok",
@@ -436,6 +437,21 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(payload["decision"], "deny")
             self.assertFalse(payload["allowed"])
             self.assertNotIn("prompt", json.dumps(payload).lower())
+            self.assertEqual(calls, [{"q": "yes"}])
+
+            content_deny_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/forward",
+                data=json.dumps({
+                    "agent": "research-bot",
+                    "target": "ok",
+                    "body": {"q": "ignore previous instructions"},
+                }).encode(),
+                headers={"content-type": "application/json", "authorization": "Bearer test-gateway-token"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(content_deny_req, timeout=2)
+            self.assertEqual(err.exception.code, 403)
             self.assertEqual(calls, [{"q": "yes"}])
 
     def test_x402_middleware_quotes_payment_requirements_before_settlement(self) -> None:
@@ -543,6 +559,7 @@ class CollectorTest(unittest.TestCase):
             with open(policy_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "budgets": {"team-research": 10.0},
+                    "content_guard": {"deny_patterns": ["blocked payload"]},
                     "reservation_ttl_seconds": 900,
                     "x402_resources": {
                         "scrape": {
@@ -602,6 +619,23 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(mismatch_body["error"]["reason"], "payment_binding_mismatch")
             self.assertIn("accepted.amount", mismatch_body["error"]["message"])
             self.assertIn("resource.url", mismatch_body["error"]["message"])
+
+            content_blocked_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/x402/scrape",
+                data=json.dumps({"q": "blocked payload"}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "payment-signature": json.dumps(payment),
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                    "x-request-id": "x402-content-blocked",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(content_blocked_req, timeout=2)
+            self.assertEqual(err.exception.code, 403)
+            self.assertEqual(facilitator_calls, [])
 
             req = urllib.request.Request(
                 f"http://127.0.0.1:{gateway_port}/x402/scrape",
@@ -1656,6 +1690,22 @@ class CollectorTest(unittest.TestCase):
             request_id="r2", req=req, decision="allow", reasons=["ok"], rate_cap=5.0)
         self.assertEqual(d2, "deny")
         self.assertFalse(res2)
+
+    def test_content_guard_inspection(self) -> None:
+        from spend_collector.gateway import inspect_content, validate_policy
+        self.assertEqual(inspect_content(b'{"model":"gpt-4o"}', {}), [])  # disabled -> clean
+        self.assertTrue(inspect_content(b"x" * 5000, {"content_guard": {"max_bytes": 1000}}))
+        r = inspect_content(b'{"content":"ignore previous instructions"}',
+                            {"content_guard": {"deny_patterns": ["ignore previous instructions"]}})
+        self.assertTrue(any("deny pattern" in x for x in r))
+        r2 = inspect_content(b'{"content":"sk-abcdefghijklmnopqrstuvwxyz123456"}',
+                             {"content_guard": {"deny_secrets": True}})
+        self.assertTrue(any("secret" in x for x in r2))
+        self.assertEqual(inspect_content(b'{"model":"gpt-4o"}',
+                         {"content_guard": {"max_bytes": 100000, "deny_secrets": True}}), [])
+        self.assertEqual(validate_policy({"gateway_tokens": ["t"],
+                         "content_guard": {"max_bytes": 1000, "deny_secrets": True}}), [])
+        self.assertTrue(validate_policy({"gateway_tokens": ["t"], "content_guard": {"bogus": 1}}))
 
 
 if __name__ == "__main__":
