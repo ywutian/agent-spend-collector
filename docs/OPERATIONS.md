@@ -45,7 +45,9 @@ frequently and keep the SQLite ledger as the durable history.
 
 - Use restricted/read-only keys when providers support them.
 - Do not store private keys, card data, PAN/CVV, or wallet seed material.
-- The collector does not move funds and does not enforce policy.
+- The collector pulls are read-only and do not move funds.
+- The gateway enforces policy inline; only configured `/x402/<resource-id>`
+  routes settle already-signed x402 payments through a facilitator.
 - Treat alerts as evidence for investigation or for future inline enforcement.
 - `report.html` shows a short evidence suffix, not the raw source payload.
 
@@ -86,6 +88,15 @@ python3 -m spend_collector guard \
 The gateway checks policy and ledger history only. It is the enforcement point
 when your agent, LLM proxy, or x402 middleware honors the decision.
 It does not return prompts, rewrite prompts, or inject model instructions.
+
+For x402 seller-side middleware, configure `x402_resources` in the policy and
+serve clients from `/x402/<resource-id>`. A request without payment gets HTTP 402
+with `PAYMENT-REQUIRED`; an x402-capable client retries with `PAYMENT-SIGNATURE`
+or legacy `X-PAYMENT`. The gateway then reserves budget, calls the configured
+facilitator `/verify` and `/settle` endpoints, forwards to the protected upstream
+only after settlement, returns `PAYMENT-RESPONSE`, records the settlement on
+`api_x402`, and releases the reservation. Keep facilitator credentials in
+`facilitator_auth_env`, not in the policy file.
 
 For provider-compatible SDKs, keep the real provider key in the gateway process
 and give agents only a gateway token:

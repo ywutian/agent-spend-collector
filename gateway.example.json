@@ -71,5 +71,25 @@
         "content-type": "application/json"
       }
     }
+  },
+  "x402_resources": {
+    "scraper-paid": {
+      "url": "https://example.com/scrape",
+      "resource_url": "https://your-api.example.com/x402/scraper-paid",
+      "method": "POST",
+      "amount": 2.5,
+      "asset": "0xYourUSDCContract",
+      "asset_decimals": 6,
+      "pay_to": "0xYourReceivingAddress",
+      "network": "eip155:8453",
+      "service": "/scrape",
+      "description": "Paid scraper call",
+      "budget": "team-research",
+      "facilitator_url": "https://api.cdp.coinbase.com/platform/v2/x402",
+      "facilitator_auth_env": "CDP_X402_FACILITATOR_TOKEN",
+      "headers": {
+        "content-type": "application/json"
+      }
+    }
   }
 }

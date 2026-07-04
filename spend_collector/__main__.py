@@ -21,6 +21,7 @@ from .gateway import (
     decide,
     record_forwarded_spend,
     record_target_spend,
+    record_x402_settlement,
     require_valid_policy,
     validate_policy as validate_policy_data,
 )
@@ -206,6 +207,91 @@ def _write_json_artifact(path: str | Path, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def _decode_x402_header(value: str) -> dict:
+    import base64
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("missing payment payload")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        padded = raw + "=" * (-len(raw) % 4)
+        data = json.loads(base64.b64decode(padded).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("payment payload must be an object")
+    return data
+
+
+def _x402_amount_units(resource: dict) -> str:
+    if resource.get("amount_units") is not None:
+        return str(resource["amount_units"])
+    decimals = int(resource.get("asset_decimals", 6))
+    return str(int(round(float(resource["amount"]) * (10 ** decimals))))
+
+
+def _x402_payment_requirements(resource: dict) -> dict:
+    return {
+        "scheme": str(resource.get("scheme", "exact")),
+        "network": str(resource.get("network", "eip155:8453")),
+        "asset": str(resource["asset"]),
+        "amount": _x402_amount_units(resource),
+        "payTo": str(resource["pay_to"]),
+        "maxTimeoutSeconds": int(resource.get("max_timeout_seconds", 60)),
+        "extra": {
+            "name": str(resource.get("asset_name", "USDC")),
+            "version": str(resource.get("asset_version", "2")),
+        },
+    }
+
+
+def _x402_public_requirements(resource_id: str, resource: dict, requirements: dict) -> dict:
+    return {
+        "x402Version": int(resource.get("x402_version", 2)),
+        "resource": resource_id,
+        "paymentRequirements": requirements,
+        "description": str(resource.get("description") or resource.get("service") or resource_id),
+        "mimeType": str(resource.get("mime_type", "application/json")),
+    }
+
+
+def _x402_payment_binding_errors(payment_payload: dict, requirements: dict, resource: dict) -> list[str]:
+    accepted = payment_payload.get("accepted")
+    if not isinstance(accepted, dict):
+        return ["payment payload missing accepted requirements"]
+    errors: list[str] = []
+    for key in ("scheme", "network", "asset", "amount", "payTo"):
+        if str(accepted.get(key, "")) != str(requirements.get(key, "")):
+            errors.append(f"payment accepted.{key} does not match requirements")
+
+    resource_payload = payment_payload.get("resource")
+    if isinstance(resource_payload, dict):
+        signed_url = str(resource_payload.get("url") or "")
+        required_url = str(resource.get("resource_url") or resource.get("url") or "")
+        if signed_url and required_url and signed_url != required_url:
+            errors.append("payment resource.url does not match configured resource")
+    else:
+        errors.append("payment payload missing resource binding")
+    return errors
+
+
+def _facilitator_request_json(url: str, payload: dict, resource: dict) -> dict:
+    headers = {"content-type": "application/json"}
+    auth_env = resource.get("facilitator_auth_env")
+    if auth_env and os.environ.get(str(auth_env)):
+        headers["authorization"] = f"Bearer {os.environ[str(auth_env)]}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=float(resource.get("timeout", 30))) as resp:
+        data = json.load(resp)
+    if not isinstance(data, dict):
+        raise ValueError("facilitator response must be a JSON object")
+    return data
 
 
 def _alert_payload(alerts: list, summary: dict) -> dict | None:
@@ -749,10 +835,16 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
     require_valid_policy(startup_policy, env_token=os.environ.get("SPEND_GATEWAY_TOKEN"))
 
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, code: int, payload: dict) -> None:
+        def _send(self, code: int, payload: dict, headers: dict | None = None) -> None:
             body = json.dumps(payload, indent=2, sort_keys=True).encode()
             self.send_response(code)
-            self.send_header("content-type", "application/json")
+            sent_content_type = False
+            for key, value in (headers or {}).items():
+                if key.lower() == "content-type":
+                    sent_content_type = True
+                self.send_header(str(key), str(value))
+            if not sent_content_type:
+                self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -767,7 +859,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_upstream(self, resp) -> bytes | None:
+        def _send_upstream(self, resp, extra_headers: dict | None = None) -> bytes | None:
             headers = dict(resp.headers.items())
             content_type = headers.get("Content-Type", headers.get("content-type", ""))
             is_stream = _is_event_stream(content_type)
@@ -776,6 +868,8 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 if key.lower() in {"connection", "content-length", "transfer-encoding"}:
                     continue
                 self.send_header(key, value)
+            for key, value in (extra_headers or {}).items():
+                self.send_header(str(key), str(value))
             if not is_stream:
                 body = resp.read()
                 self.send_header("content-length", str(len(body)))
@@ -802,6 +896,11 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             if not isinstance(payload, dict):
                 raise ValueError("request body must be a JSON object")
             return payload
+
+        def _read_raw(self) -> bytes:
+            length = int(self.headers.get("content-length", "0"))
+            self._raw_body = self.rfile.read(length)
+            return self._raw_body
 
         def _authorized(self, policy: dict, token: str = "") -> bool:
             tokens = policy.get("gateway_tokens")
@@ -859,6 +958,182 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 "session": payload.get("session", ""),
             }
             return target, guard_payload
+
+        def _x402_route(self, policy: dict) -> tuple[str, dict] | None:
+            parsed = urllib.parse.urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/", 1)
+            if len(parts) < 2 or parts[0] != "x402":
+                return None
+            resource_id = parts[1].split("/", 1)[0]
+            resource = policy.get("x402_resources", {}).get(resource_id)
+            if not isinstance(resource, dict):
+                return None
+            return resource_id, resource
+
+        def _x402_guard_payload(self, resource_id: str, resource: dict) -> dict:
+            agent = self.headers.get("x-agent-id") or resource.get("agent")
+            if not agent:
+                raise ValueError("x402 calls require X-Agent-ID or x402 resource agent")
+            return {
+                "agent": agent,
+                "rail": "api_x402",
+                "amount": float(resource["amount"]),
+                "budget": self.headers.get("x-budget-id") or resource.get("budget", "default"),
+                "provider": "x402",
+                "service": resource.get("service", resource_id),
+                "merchant": resource.get("merchant") or resource.get("pay_to", ""),
+                "session": self.headers.get("x-session-id", ""),
+                "asset": resource.get("asset_name", "USDC"),
+                "asset_decimals": int(resource.get("asset_decimals", 6)),
+                "network": resource.get("network", "eip155:8453"),
+            }
+
+        def _x402_headers(self, resource: dict) -> dict[str, str]:
+            merged_headers = dict(resource.get("headers", {}))
+            for header, env_name in resource.get("headers_env", {}).items():
+                value = os.environ.get(str(env_name))
+                if value:
+                    merged_headers[str(header)] = value
+            passthrough = {
+                str(k): str(v)
+                for k, v in self.headers.items()
+                if k.lower() not in {
+                    "host", "content-length", "connection", "authorization",
+                    "payment-required", "payment-signature", "payment-response",
+                    "x-payment", "x-payment-response", "x-agent-id", "x-budget-id",
+                    "x-session-id", "x-gateway-token",
+                }
+            }
+            passthrough.update({str(k): str(v) for k, v in merged_headers.items()})
+            return passthrough
+
+        def _send_x402_required(self, resource_id: str, resource: dict, requirements: dict,
+                                status: int = 402, error: dict | None = None) -> None:
+            payload = _x402_public_requirements(resource_id, resource, requirements)
+            if error:
+                payload["error"] = error
+            encoded = json.dumps(payload, separators=(",", ":"))
+            self._send(status, payload, headers={
+                "content-type": "application/json",
+                "payment-required": encoded,
+            })
+
+        def _forward_x402_resource(self, resource: dict, payment_response: dict) -> None:
+            body = getattr(self, "_raw_body", b"")
+            method = str(resource.get("method", self.command)).upper()
+            data = None if method == "GET" else body
+            req = urllib.request.Request(
+                str(resource["url"]),
+                data=data,
+                headers=self._x402_headers(resource),
+                method=method,
+            )
+            payment_header = json.dumps(payment_response, separators=(",", ":"))
+            with urllib.request.urlopen(req, timeout=float(resource.get("timeout", 30))) as resp:
+                self._send_upstream(resp, extra_headers={
+                    "payment-response": payment_header,
+                    "x-payment-response": payment_header,
+                })
+
+        def _handle_x402(self, policy: dict) -> bool:
+            route = self._x402_route(policy)
+            if not route:
+                return False
+            resource_id, resource = route
+            body = self._read_raw()
+            requirements = _x402_payment_requirements(resource)
+            guard_payload = self._x402_guard_payload(resource_id, resource)
+            payment_header = self.headers.get("payment-signature") or self.headers.get("x-payment")
+            if not payment_header:
+                with SpendStore(str(db_path)) as store:
+                    decision = decide(store, policy, self._guard_request(guard_payload)).as_dict()
+                if not decision["allowed"]:
+                    self._send(403, decision)
+                else:
+                    self._send_x402_required(resource_id, resource, requirements)
+                return True
+
+            request_id = _request_id(self.headers.get("x-request-id"))
+            with SpendStore(str(db_path)) as store:
+                if store.gateway_decision_by_request(request_id):
+                    self._send(409, {
+                        "error": "duplicate_x402_request_id",
+                        "request_id": request_id,
+                        "detail": "Use a fresh X-Request-ID and payment payload for each x402 settlement.",
+                    })
+                    return True
+            with SpendStore(str(db_path)) as store:
+                decision = _decide_and_record(
+                    store,
+                    policy,
+                    self._guard_request(guard_payload),
+                    request_id=request_id,
+                    route_type="x402",
+                    route_id=resource_id,
+                )
+            if not decision["allowed"]:
+                self._send(403, decision)
+                return True
+
+            payment_payload = _decode_x402_header(payment_header)
+            binding_errors = _x402_payment_binding_errors(payment_payload, requirements, resource)
+            if binding_errors:
+                with SpendStore(str(db_path)) as store:
+                    store.release_reservation(request_id)
+                self._send_x402_required(resource_id, resource, requirements, error={
+                    "reason": "payment_binding_mismatch",
+                    "message": "; ".join(binding_errors),
+                })
+                return True
+            facilitator = str(resource.get("facilitator_url", ""))
+            if not facilitator:
+                raise ValueError("x402 resource missing facilitator_url")
+            version = int(resource.get("x402_version", payment_payload.get("x402Version", 2)))
+            facilitator_payload = {
+                "x402Version": version,
+                "paymentPayload": payment_payload,
+                "paymentRequirements": requirements,
+            }
+            verify_result = _facilitator_request_json(
+                facilitator.rstrip("/") + "/verify",
+                facilitator_payload,
+                resource,
+            )
+            if not verify_result.get("isValid"):
+                with SpendStore(str(db_path)) as store:
+                    store.release_reservation(request_id)
+                self._send_x402_required(resource_id, resource, requirements, error={
+                    "reason": verify_result.get("invalidReason", "invalid_payment"),
+                    "message": verify_result.get("invalidMessage", "payment verification failed"),
+                })
+                return True
+
+            settle_result = _facilitator_request_json(
+                facilitator.rstrip("/") + "/settle",
+                facilitator_payload,
+                resource,
+            )
+            if settle_result.get("success") is False:
+                with SpendStore(str(db_path)) as store:
+                    store.release_reservation(request_id)
+                self._send_x402_required(resource_id, resource, requirements, error={
+                    "reason": settle_result.get("errorReason", "settlement_failed"),
+                    "message": settle_result.get("errorMessage", "payment settlement failed"),
+                })
+                return True
+
+            with SpendStore(str(db_path)) as store:
+                record_x402_settlement(
+                    store,
+                    guard_payload,
+                    request_id,
+                    requirements,
+                    verify_result,
+                    settle_result,
+                )
+            self._raw_body = body
+            self._forward_x402_resource(resource, settle_result)
+            return True
 
         def _forward(self, target: dict, payload: dict,
                      guard_payload: dict | None = None, request_id: str = "") -> None:
@@ -987,12 +1262,17 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     html = render(store, budgets, run_all(store, budgets), refresh_seconds=30)
                 self._send_bytes(200, html.encode("utf-8"), {"content-type": "text/html; charset=utf-8"})
                 return
+            policy = _load_policy(policy_path)
+            if self._handle_x402(policy):
+                return
             self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:
             try:
-                payload = self._read_json()
                 policy = _load_policy(policy_path)
+                if self._handle_x402(policy):
+                    return
+                payload = self._read_json()
                 if not self._authorized(policy):
                     self._send(401, {"error": "unauthorized"})
                     return

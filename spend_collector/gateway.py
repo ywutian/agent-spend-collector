@@ -192,6 +192,7 @@ def validate_policy(policy: dict) -> list[str]:
         "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
         "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
         "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
+        "x402_resources",
     }
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
     target_keys = {
@@ -202,6 +203,13 @@ def validate_policy(policy: dict) -> list[str]:
         "base_url", "api_key_env", "rail", "provider", "merchant",
         "service_from_body", "amount", "budget", "auth_header", "auth_prefix",
         "method", "timeout", "agent", "max_estimated_amount",
+    }
+    x402_resource_keys = {
+        "url", "resource_url", "method", "amount", "amount_units", "asset", "asset_decimals",
+        "asset_name", "asset_version", "x402_version",
+        "pay_to", "network", "scheme", "max_timeout_seconds", "description",
+        "mime_type", "budget", "merchant", "service", "facilitator_url",
+        "facilitator_auth_env", "headers", "headers_env", "timeout", "agent",
     }
 
     if not isinstance(policy, dict):
@@ -265,6 +273,20 @@ def validate_policy(policy: dict) -> list[str]:
         if "amount" not in provider and "max_estimated_amount" not in provider:
             errors.append(f"provider {name} missing amount or max_estimated_amount")
 
+    for name, resource in policy.get("x402_resources", {}).items():
+        if not isinstance(resource, dict):
+            errors.append(f"x402 resource {name} must be an object")
+            continue
+        for key in resource:
+            if key not in x402_resource_keys:
+                errors.append(f"unknown x402 resource key for {name}: {key}")
+        for required in ("url", "amount", "pay_to", "asset", "facilitator_url"):
+            if required not in resource:
+                errors.append(f"x402 resource {name} missing {required}")
+        for key, value in resource.get("headers", {}).items():
+            if "authorization" in key.lower() or str(value).startswith(("sk-", "rk_")):
+                errors.append(f"x402 resource {name} header {key} looks like a raw secret; use headers_env")
+
     return errors
 
 
@@ -290,6 +312,15 @@ def audit_config(policy: dict, *, db_path: str = "spend.db", out_dir: str = "art
         if target.get("url"):
             hosts.add(urlsplit(target["url"]).netloc)
         for value in target.get("headers_env", {}).values():
+            env_vars.add(value)
+    for resource in policy.get("x402_resources", {}).values():
+        if resource.get("url"):
+            hosts.add(urlsplit(resource["url"]).netloc)
+        if resource.get("facilitator_url"):
+            hosts.add(urlsplit(resource["facilitator_url"]).netloc)
+        if resource.get("facilitator_auth_env"):
+            env_vars.add(resource["facilitator_auth_env"])
+        for value in resource.get("headers_env", {}).values():
             env_vars.add(value)
     if policy.get("providers") or policy.get("targets"):
         env_vars.add("SPEND_GATEWAY_TOKEN")
@@ -379,6 +410,67 @@ def record_target_spend(store: SpendStore, guard_payload: dict, request_id: str)
         x_merchant_id=str(guard_payload.get("merchant", "")),
         x_receipt_ref=request_id,
         x_source_event=source_ref(provider, {"target": service, "amount": amount, "request_id": request_id}),
+        charge_category="Purchase",
+    )
+    store.ingest([event])
+    store.release_reservation(request_id)
+    return event
+
+
+def record_x402_settlement(
+    store: SpendStore,
+    guard_payload: dict,
+    request_id: str,
+    requirements: dict,
+    verify_result: dict,
+    settle_result: dict,
+):
+    """Record an x402 middleware settlement without storing the signed payment payload."""
+    amount_units = float(
+        settle_result.get("amount")
+        or (settle_result.get("extra") or {}).get("chargedAmount")
+        or requirements.get("amount")
+        or 0
+    )
+    decimals = int(guard_payload.get("asset_decimals", 6) or 6)
+    amount = amount_units / (10 ** decimals)
+    if amount <= 0:
+        amount = float(guard_payload.get("amount", 0) or 0)
+    transaction = str(
+        settle_result.get("transaction")
+        or settle_result.get("txHash")
+        or settle_result.get("tx_hash")
+        or request_id
+    )
+    asset_name = str((requirements.get("extra") or {}).get("name") or guard_payload.get("asset", "USDC"))
+    network = str(settle_result.get("network") or requirements.get("network") or guard_payload.get("network", ""))
+    payer = str(verify_result.get("payer") or settle_result.get("payer") or "unknown")
+    service = str(guard_payload.get("service") or "x402")
+    event = SpendEvent(
+        event_id=f"x402:{transaction}",
+        event_time=datetime.now(tz=timezone.utc).isoformat(),
+        rail="api_x402",
+        provider_name="x402",
+        service_name=service,
+        billed_cost=amount,
+        billing_currency=asset_name,
+        consumed_quantity=1,
+        pricing_unit="call",
+        x_agent_id=str(guard_payload.get("agent", payer)),
+        x_budget_id=str(guard_payload.get("budget", "default")),
+        x_session_id=str(guard_payload.get("session", "")),
+        x_merchant_id=str(requirements.get("payTo") or guard_payload.get("merchant", "")),
+        x_receipt_ref=transaction,
+        x_source_event=source_ref("x402", {
+            "transaction": transaction,
+            "payer": payer,
+            "network": network,
+            "amount": requirements.get("amount"),
+            "payTo": requirements.get("payTo"),
+            "resource": service,
+            "request_id": request_id,
+            "success": settle_result.get("success"),
+        }),
         charge_category="Purchase",
     )
     store.ingest([event])

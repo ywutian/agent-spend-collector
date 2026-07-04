@@ -17,7 +17,10 @@ depend on a hosted control plane.
 - Audit logs store metadata only: agent, rail, provider, amount, budget,
   decision, and reasons.
 - Audit logs do not store prompts, request bodies, completions, responses,
-  provider keys, or gateway tokens.
+  provider keys, gateway tokens, or x402 payment signatures.
+- Configured `/x402/<resource-id>` routes settle already-signed payment payloads
+  through your facilitator. Ledger rows store settlement metadata such as payer,
+  transaction, amount, and resource, not the signed payment payload.
 
 ## Recommended Deployment
 

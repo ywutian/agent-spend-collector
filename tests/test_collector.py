@@ -437,6 +437,229 @@ class CollectorTest(unittest.TestCase):
             self.assertNotIn("prompt", json.dumps(payload).lower())
             self.assertEqual(calls, [{"q": "yes"}])
 
+    def test_x402_middleware_quotes_payment_requirements_before_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "budgets": {"team-research": 10.0},
+                    "x402_resources": {
+                        "scrape": {
+                            "url": "http://127.0.0.1:9/scrape",
+                            "amount": 1.25,
+                            "asset": "0xUSDC",
+                            "pay_to": "0xmerchant",
+                            "network": "eip155:8453",
+                            "service": "/scrape",
+                            "budget": "team-research",
+                            "facilitator_url": "http://127.0.0.1:9",
+                        },
+                    },
+                }, f)
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), gateway_thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/x402/scrape",
+                headers={"x-agent-id": "research-bot", "x-budget-id": "team-research"},
+                method="GET",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(req, timeout=2)
+            self.assertEqual(err.exception.code, 402)
+            header = err.exception.headers["payment-required"]
+            required = json.loads(header)
+            body = json.loads(err.exception.read())
+
+        self.assertEqual(required["paymentRequirements"]["amount"], "1250000")
+        self.assertEqual(required["paymentRequirements"]["payTo"], "0xmerchant")
+        self.assertEqual(body["resource"], "scrape")
+
+    def test_x402_middleware_verifies_settles_forwards_and_records(self) -> None:
+        upstream_calls: list[dict] = []
+        facilitator_calls: list[dict] = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                upstream_calls.append({
+                    "path": self.path,
+                    "payment": self.headers.get("payment-signature"),
+                    "body": json.loads(body),
+                })
+                out = b'{"paid": true}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, fmt, *args):
+                return
+
+        class Facilitator(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))))
+                facilitator_calls.append({"path": self.path, "body": body})
+                if self.path.endswith("/verify"):
+                    out = {"isValid": True, "payer": "0xpayer", "extra": {}}
+                else:
+                    out = {
+                        "success": True,
+                        "payer": "0xpayer",
+                        "transaction": "0xsettled",
+                        "network": "eip155:8453",
+                        "amount": "2500000",
+                    }
+                raw = json.dumps(out).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        self.addCleanup(lambda: (upstream.shutdown(), upstream_thread.join(1), upstream.server_close()))
+
+        facilitator = ThreadingHTTPServer(("127.0.0.1", 0), Facilitator)
+        facilitator_thread = threading.Thread(target=facilitator.serve_forever, daemon=True)
+        facilitator_thread.start()
+        self.addCleanup(lambda: (facilitator.shutdown(), facilitator_thread.join(1), facilitator.server_close()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            policy_path = Path(tmp) / "policy.json"
+            with open(policy_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "budgets": {"team-research": 10.0},
+                    "reservation_ttl_seconds": 900,
+                    "x402_resources": {
+                        "scrape": {
+                            "url": f"http://127.0.0.1:{upstream.server_port}/paid",
+                            "resource_url": "https://seller.example/x402/scrape",
+                            "method": "POST",
+                            "amount": 2.50,
+                            "asset": "0xUSDC",
+                            "pay_to": "0xmerchant",
+                            "network": "eip155:8453",
+                            "service": "/paid",
+                            "budget": "team-research",
+                            "facilitator_url": f"http://127.0.0.1:{facilitator.server_port}",
+                        },
+                    },
+                }, f)
+            gateway_server = make_gateway_server(str(db_path), str(policy_path), port=0)
+            gateway_port = gateway_server.server_port
+            gateway_thread = threading.Thread(target=gateway_server.serve_forever, daemon=True)
+            gateway_thread.start()
+            self.addCleanup(lambda: (gateway_server.shutdown(), gateway_thread.join(1), gateway_server.server_close()))
+            self.wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+
+            payment = {
+                "x402Version": 2,
+                "accepted": {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "asset": "0xUSDC",
+                    "amount": "2500000",
+                    "payTo": "0xmerchant",
+                },
+                "payload": {"authorization": {"from": "0xpayer"}, "signature": "0xsig"},
+                "resource": {"url": "https://seller.example/x402/scrape"},
+            }
+            mismatched = {
+                **payment,
+                "accepted": {**payment["accepted"], "amount": "9999999"},
+                "resource": {"url": "https://seller.example/x402/other"},
+            }
+            bad_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/x402/scrape",
+                data=json.dumps({"q": "no"}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "payment-signature": json.dumps(mismatched),
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                    "x-request-id": "x402-bad-binding",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(bad_req, timeout=2)
+            self.assertEqual(err.exception.code, 402)
+            mismatch_body = json.loads(err.exception.read())
+            self.assertEqual(mismatch_body["error"]["reason"], "payment_binding_mismatch")
+            self.assertIn("accepted.amount", mismatch_body["error"]["message"])
+            self.assertIn("resource.url", mismatch_body["error"]["message"])
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/x402/scrape",
+                data=json.dumps({"q": "yes"}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "payment-signature": json.dumps(payment),
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                    "x-request-id": "x402-req-1",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(json.load(resp), {"paid": True})
+                payment_response = json.loads(resp.headers["payment-response"])
+
+            duplicate_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/x402/scrape",
+                data=json.dumps({"q": "yes"}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "payment-signature": json.dumps(payment),
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                    "x-request-id": "x402-req-1",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(duplicate_req, timeout=2)
+            self.assertEqual(err.exception.code, 409)
+
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                row = store.db.execute(
+                    "SELECT rail, provider_name, billed_cost, billing_currency, x_agent_id, "
+                    "x_budget_id, x_receipt_ref FROM spend_events"
+                ).fetchone()
+                active = store.db.execute(
+                    "SELECT COUNT(*) FROM spend_reservations WHERE status = 'active'"
+                ).fetchone()[0]
+
+        self.assertEqual([c["path"] for c in facilitator_calls], ["/verify", "/settle"])
+        self.assertEqual(facilitator_calls[0]["body"]["paymentRequirements"]["amount"], "2500000")
+        self.assertEqual(len(upstream_calls), 1)
+        self.assertIsNone(upstream_calls[0]["payment"])
+        self.assertEqual(upstream_calls[0]["body"], {"q": "yes"})
+        self.assertEqual(payment_response["transaction"], "0xsettled")
+        self.assertEqual(row["rail"], "api_x402")
+        self.assertEqual(row["provider_name"], "x402")
+        self.assertEqual(row["billed_cost"], 2.5)
+        self.assertEqual(row["billing_currency"], "USDC")
+        self.assertEqual(row["x_agent_id"], "research-bot")
+        self.assertEqual(row["x_budget_id"], "team-research")
+        self.assertEqual(row["x_receipt_ref"], "0xsettled")
+        self.assertEqual(active, 0)
+
     def test_provider_compatible_gateway_swaps_agent_token_for_provider_key(self) -> None:
         calls: list[dict] = []
 

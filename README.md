@@ -153,6 +153,33 @@ body to the configured URL. If denied, it does not call the target and returns a
 JSON decision such as `{"decision":"deny","allowed":false,"reasons":[...]}`.
 It never returns prompts, rewrites prompts, or injects model instructions.
 
+For true x402 seller-side middleware, define an `x402_resources` entry. The
+gateway exposes it at `/x402/<resource-id>`:
+
+```bash
+# First request: no payment yet, returns HTTP 402 + PAYMENT-REQUIRED.
+curl -i http://127.0.0.1:8787/x402/scraper-paid \
+  -H 'X-Agent-ID: research-bot' \
+  -H 'X-Budget-ID: team-research'
+
+# Second request: x402-capable clients retry with PAYMENT-SIGNATURE.
+curl -i http://127.0.0.1:8787/x402/scraper-paid \
+  -H 'content-type: application/json' \
+  -H 'X-Agent-ID: research-bot' \
+  -H 'X-Budget-ID: team-research' \
+  -H "PAYMENT-SIGNATURE: $PAYMENT_SIGNATURE" \
+  -d '{"query":"pricing data"}'
+```
+
+On the paid retry, the gateway checks policy and budget, verifies and settles the
+payment through the configured x402 facilitator, forwards the request to the
+protected upstream only after settlement, returns `PAYMENT-RESPONSE`, and records
+the settlement on the `api_x402` rail. It also accepts the legacy `X-PAYMENT`
+header for clients that still use that spelling. The signed payment payload is
+bound to the configured `amount`, `pay_to`, `network`, `asset`, and
+`resource_url` (or `url` when `resource_url` is omitted), so a payment signed for
+one resource cannot be reused against another configured resource.
+
 For SDKs that support a custom base URL, put the real provider key only on the
 gateway and give the agent a gateway token:
 
@@ -197,8 +224,10 @@ If an allowed downstream call fails before money moves, release its hold:
 python3 -m spend_collector release-reservation --db spend.db --request-id req_123
 ```
 
-This is the first inline-control layer: it does not move funds, but callers can
-block the spend when the decision is `deny`.
+This is the first inline-control layer: provider proxy routes do not move funds,
+while `/x402/<resource-id>` routes settle an already-signed x402 payment before
+delivering the protected resource. Callers should block the spend when the
+decision is `deny`.
 
 ## Verify locally
 
@@ -407,8 +436,9 @@ detect -> inline -> on-chain
 7. Done: Azure cloud cost rail via Cost Management (`pull-azure`).
 8. Done: Stripe Events rail, token + crypto + cloud + card in one ledger (`pull-stripe`).
 9. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-10. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
-11. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
+10. Done: inline pre-spend gateway and LLM proxy (`guard`, `/guard`, provider routes).
+11. Done: x402 seller-side middleware with `PAYMENT-REQUIRED`, facilitator verify/settle, and ledger recording.
+12. Next: Grafana/Metabase on the DB; stronger request-bound replay protection for dynamic x402 pricing.
 
 ## Open source, and what's commercial
 
