@@ -265,6 +265,13 @@ override per your account):
 - **Payment rails** (captured by ingestion): `stripe`, `x402` (+ `skyfire`,
   `coinbase`).
 
+Tool spend is recorded in real time as the target's flat per-call `amount` — enough
+for budget caps and call-volume anomalies. Tools meter differently (audio seconds,
+characters, pages), so treat that as an estimate; the authoritative cost is the
+provider's billed charge, captured separately by `pull-stripe`. They are two views
+of the same spend (real-time estimate on the `api` rail vs. billed truth on the
+`card` rail) — reconcile by comparing them, not by summing; the delta is a signal.
+
 **Naming a known LLM provider is enough** — the gateway fills its base URL and key
 env from the catalog, so a policy entry can be just a budget and cap. Route at
 `/<provider>/...`:
