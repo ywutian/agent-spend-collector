@@ -743,6 +743,41 @@ def guard(args) -> dict:
     return decision
 
 
+def _edit_frozen(policy_path: str, agents: list[str], budgets: list[str], *, remove: bool) -> dict:
+    policy = _load_json_file(policy_path)
+    for key, vals in (("frozen_agents", agents), ("frozen_budgets", budgets)):
+        current = list(policy.get(key, []))
+        for v in vals:
+            if remove:
+                current = [x for x in current if x != v]
+            elif v not in current:
+                current.append(v)
+        policy[key] = current
+    with open(policy_path, "w", encoding="utf-8") as f:
+        json.dump(policy, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return policy
+
+
+def freeze(args, *, remove: bool = False) -> dict:
+    """Kill-switch: add (or with unfreeze, remove) agents/budgets from the policy's
+    frozen lists. The running gateway reloads policy per request, so it takes effect
+    immediately."""
+    agents, budgets = list(args.agent or []), list(args.budget or [])
+    if not agents and not budgets:
+        print("freeze needs at least one --agent or --budget")
+        sys.exit(1)
+    policy = _edit_frozen(args.policy, agents, budgets, remove=remove)
+    print(f"{'unfrozen' if remove else 'FROZEN'}: {', '.join(agents + budgets)}")
+    print(f"frozen_agents={policy.get('frozen_agents', [])}  "
+          f"frozen_budgets={policy.get('frozen_budgets', [])}")
+    return policy
+
+
+def unfreeze(args) -> dict:
+    return freeze(args, remove=True)
+
+
 def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Path | None = None,
                         host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
     startup_policy = _load_policy(policy_path)
@@ -1190,6 +1225,12 @@ def _parser() -> argparse.ArgumentParser:
     release_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
     release_p.add_argument("--request-id", required=True, help="gateway request id")
 
+    for name, verb in (("freeze", "freeze (deny all spend)"), ("unfreeze", "unfreeze")):
+        fp = sub.add_parser(name, help=f"{verb} an agent/budget in the policy (kill-switch)")
+        fp.add_argument("--policy", required=True, help="gateway policy JSON to edit")
+        fp.add_argument("--agent", nargs="*", default=[], help="agent id(s)")
+        fp.add_argument("--budget", nargs="*", default=[], help="budget id(s)")
+
     return parser
 
 
@@ -1230,6 +1271,10 @@ def main(argv: list[str] | None = None) -> None:
         audit_config_cmd(args.policy, args.db, args.out_dir)
     elif cmd == "release-reservation":
         release_reservation_cmd(args.db, args.request_id)
+    elif cmd == "freeze":
+        freeze(args)
+    elif cmd == "unfreeze":
+        unfreeze(args)
 
 
 if __name__ == "__main__":

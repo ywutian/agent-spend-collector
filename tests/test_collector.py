@@ -1390,6 +1390,41 @@ class CollectorTest(unittest.TestCase):
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2)
             self.assertEqual(err.exception.code, 401)
 
+    def test_gateway_kill_switch_freezes_agent(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        req = GuardRequest(x_agent_id="rogue-bot", rail="llm_token", amount=0.1, x_budget_id="team")
+        self.assertEqual(decide(store, {"frozen_agents": ["rogue-bot"]}, req).decision, "deny")
+        self.assertEqual(decide(store, {"frozen_budgets": ["team"]}, req).decision, "deny")
+        self.assertEqual(decide(store, {"frozen_agents": ["someone-else"]}, req).decision, "allow")
+
+    def test_gateway_blocks_on_current_anomaly(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        evs = [SpendEvent(f"s{i}", f"2026-06-30T10:0{i}:00+00:00", "llm_token", "openai",
+               "gpt-4o", 0.001, "USD", 10, "token", "spiky-bot", "b") for i in range(5)]
+        evs.append(SpendEvent("s-big", "2026-06-30T10:06:00+00:00", "llm_token", "openai",
+                   "gpt-4o", 10.0, "USD", 100000, "token", "spiky-bot", "b"))
+        store.ingest(evs)
+        self.assertTrue(any(a.subject == "spiky-bot" and a.severity == "high" for a in run_all(store, {})))
+        policy = {"block_on_anomaly": True}
+        d = decide(store, policy, GuardRequest(x_agent_id="spiky-bot", rail="llm_token", amount=0.01, x_budget_id="b"))
+        self.assertEqual(d.decision, "deny")
+        self.assertTrue(any("blocked on anomaly" in r for r in d.reasons))
+        calm = decide(store, policy, GuardRequest(x_agent_id="calm-bot", rail="llm_token", amount=0.01, x_budget_id="b"))
+        self.assertEqual(calm.decision, "allow")
+
+    def test_freeze_cli_edits_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "policy.json"
+            p.write_text(json.dumps({"gateway_tokens": ["t"]}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["freeze", "--policy", str(p), "--agent", "rogue-bot"])
+            self.assertIn("rogue-bot", json.loads(p.read_text())["frozen_agents"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["unfreeze", "--policy", str(p), "--agent", "rogue-bot"])
+            self.assertNotIn("rogue-bot", json.loads(p.read_text())["frozen_agents"])
+
 
 if __name__ == "__main__":
     unittest.main()

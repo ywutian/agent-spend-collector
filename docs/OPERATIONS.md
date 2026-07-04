@@ -185,3 +185,15 @@ To slow a runaway loop before it drains the whole budget, add a velocity cap to 
 policy: `max_amount_per_hour` — a per-budget map (`{"team-research": 5.0}`) or a bare
 number for all budgets — denies once the last hour's spend for that budget would
 exceed it.
+
+Two stronger interception controls:
+
+- **Kill-switch.** `python3 -m spend_collector freeze --policy p.json --agent rogue-bot`
+  (or `--budget`) adds it to the policy's `frozen_agents` / `frozen_budgets`; the
+  running gateway reloads policy per request, so it denies immediately. `unfreeze`
+  reverses it. Break-glass for an incident.
+- **Behavioral blocking.** Set `block_on_anomaly` in the policy (`true` blocks on any
+  high-severity alert, or give a list of detector kinds) and the gateway denies a call
+  while its agent is *currently* flagged by a detector — turning after-the-fact alerts
+  into in-flight interception. It runs the detectors per guarded request, so
+  cache/precompute if the added latency matters at volume.
