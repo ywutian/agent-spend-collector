@@ -23,6 +23,7 @@ from .gateway import (
     require_valid_policy,
     validate_policy as validate_policy_data,
 )
+from .providers import llm_provider
 from .report import render
 from .store import SpendStore
 
@@ -494,6 +495,9 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             provider = policy.get("providers", {}).get(provider_id)
             if not isinstance(provider, dict):
                 return None
+            known = llm_provider(provider_id)  # fill base_url/api_key_env from the catalog
+            if known:
+                provider = {**known, **provider}  # policy overrides catalog defaults
             suffix = "/" + parts[1] if len(parts) > 1 else "/"
             if parsed.query:
                 suffix += "?" + parsed.query

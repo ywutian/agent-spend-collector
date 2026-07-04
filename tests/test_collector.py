@@ -22,7 +22,8 @@ from spend_collector.adapters import (
     _price, _tokencost_price, from_llm_usage, from_stripe_events, from_x402_settlements,
 )
 from spend_collector.detectors import run_all
-from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
+from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend, validate_policy
+from spend_collector.providers import KNOWN_PROVIDERS, llm_provider, usage_tokens
 from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
@@ -896,6 +897,21 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(event.consumed_quantity, 1500)
         self.assertEqual(event.service_name, "gemini-2.5-flash")
         self.assertGreater(event.billed_cost, 0)
+
+    def test_provider_catalog_and_usage_shapes(self) -> None:
+        # usage_tokens spans the four LLM response families
+        self.assertEqual(usage_tokens({"usage": {"prompt_tokens": 10, "completion_tokens": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"usage": {"input_tokens": 10, "output_tokens": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"meta": {"billed_units": {"input_tokens": 10, "output_tokens": 5}}}), (10, 5))
+        self.assertEqual(usage_tokens({}), (0, 0))
+        # catalog lets a policy name a provider instead of writing base_url/api_key_env
+        self.assertIn("groq", KNOWN_PROVIDERS)
+        self.assertTrue(llm_provider("groq")["base_url"])
+        self.assertIsNone(llm_provider("not-a-provider"))
+        errs = validate_policy({"gateway_tokens": ["t"], "providers": {
+            "mistral": {"service_from_body": "model", "amount": 0.25, "budget": "b"}}})
+        self.assertEqual(errs, [])  # known provider name -> base_url/api_key_env optional
 
     def test_gateway_records_cohere_usage_shape(self) -> None:
         # Cohere: meta.billed_units.{input_tokens,output_tokens}; model from the request

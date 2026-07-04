@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .adapters import _price
+from .providers import llm_provider, usage_tokens
 from .schema import SpendEvent, source_ref
 from .store import SpendStore
 
@@ -227,10 +228,11 @@ def validate_policy(policy: dict) -> list[str]:
         for key in provider:
             if key not in provider_keys:
                 errors.append(f"unknown provider key for {name}: {key}")
-        if "base_url" not in provider:
-            errors.append(f"provider {name} missing base_url")
-        if "api_key_env" not in provider:
-            errors.append(f"provider {name} missing api_key_env")
+        known = llm_provider(name)  # base_url/api_key_env optional for a known provider name
+        if "base_url" not in provider and not (known and known.get("base_url")):
+            errors.append(f"provider {name} missing base_url (or use a known provider name)")
+        if "api_key_env" not in provider and not (known and known.get("api_key_env")):
+            errors.append(f"provider {name} missing api_key_env (or use a known provider name)")
         if "amount" not in provider and "max_estimated_amount" not in provider:
             errors.append(f"provider {name} missing amount or max_estimated_amount")
 
@@ -287,18 +289,11 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         data = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    # Usage container across shapes: OpenAI/compat "usage", Gemini "usageMetadata",
-    # Cohere "meta.billed_units".
-    usage = ((data.get("usage") or data.get("usageMetadata")
-              or (data.get("meta") or {}).get("billed_units")) if isinstance(data, dict) else None) or {}
-    if not usage:
+    prompt, completion = usage_tokens(data)  # OpenAI / Anthropic / Gemini / Cohere shapes
+    if not prompt and not completion:
         return None
     pname = str(provider.get("provider", "openai"))
     model = str(data.get("model") or data.get("modelVersion") or guard_payload.get("service") or pname)
-    # OpenAI: prompt_/completion_tokens. Anthropic & Cohere: input_/output_tokens.
-    # Gemini: promptTokenCount/candidatesTokenCount.
-    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", usage.get("promptTokenCount", 0))) or 0)
-    completion = int(usage.get("completion_tokens", usage.get("output_tokens", usage.get("candidatesTokenCount", 0))) or 0)
     rid = str(data.get("id") or f"{guard_payload.get('agent', 'agent')}:{prompt}:{completion}")
     event = SpendEvent(
         event_id=f"gw:{rid}",
@@ -315,7 +310,7 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         x_session_id=str(guard_payload.get("session", "")),
         x_merchant_id=pname,
         x_receipt_ref=str(data.get("id", "")),
-        x_source_event=source_ref(pname, {"id": data.get("id"), "model": model, "usage": usage}),
+        x_source_event=source_ref(pname, {"id": data.get("id"), "model": model, "tokens": [prompt, completion]}),
     )
     store.ingest([event])
     return event
