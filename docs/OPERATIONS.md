@@ -215,3 +215,15 @@ markers), and `deny_secrets: true` (block a request that appears to carry an API
 or private key outbound). It reads the body in memory for the decision only — content
 is never stored. Deterministic checks only; deep threat analysis is out of scope for
 the open-source gateway.
+
+Two stronger interception controls:
+
+- **Kill-switch.** `python3 -m spend_collector freeze --policy p.json --agent rogue-bot`
+  (or `--budget`) adds it to the policy's `frozen_agents` / `frozen_budgets`; the
+  running gateway reloads policy per request, so it denies immediately. `unfreeze`
+  reverses it. Break-glass for an incident.
+- **Behavioral blocking.** Set `block_on_anomaly` in the policy (`true` blocks on any
+  high-severity alert, or give a list of detector kinds) and the gateway denies a call
+  while its agent is *currently* flagged by a detector — turning after-the-fact alerts
+  into in-flight interception. It runs the detectors per guarded request, so
+  cache/precompute if the added latency matters at volume.

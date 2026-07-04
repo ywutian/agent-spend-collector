@@ -165,6 +165,12 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     deny: list[str] = []
     agent = _agent_policy(policy, req.x_agent_id)
 
+    # Kill-switch: a frozen agent or budget is denied outright (break-glass).
+    if req.x_agent_id in set(_list(policy.get("frozen_agents"))):
+        deny.append(f"agent {req.x_agent_id} is frozen (kill-switch)")
+    if req.x_budget_id in set(_list(policy.get("frozen_budgets"))):
+        deny.append(f"budget {req.x_budget_id} is frozen (kill-switch)")
+
     allowed_agents = set(_list(policy.get("agents_allowed")))
     if allowed_agents and req.x_agent_id not in allowed_agents:
         deny.append(f"agent {req.x_agent_id} is not allowed")
@@ -214,6 +220,23 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     elif policy.get("warn_new_merchants") and not _merchant_seen(store, req):
         reasons.append(f"merchant {merchant_key} has no ledger history")
 
+    # Behavioral: block a call while its agent is currently flagged by a detector,
+    # turning after-the-fact alerts into in-flight interception. `block_on_anomaly`
+    # is true (block on any high-severity alert) or a list of kinds to block on.
+    # ponytail: runs the detectors per guarded request; cache/precompute if the
+    # added latency matters at volume. Skipped when a cheaper check already denied.
+    block = policy.get("block_on_anomaly")
+    if block and not deny:
+        from .detectors import run_all
+        kinds = None if block is True else set(_list(block))
+        budgets = {str(k): float(v) for k, v in (policy.get("budgets") or {}).items()}
+        for a in run_all(store, budgets):
+            if a.subject != req.x_agent_id:
+                continue
+            if (kinds is None and a.severity == "high") or (kinds is not None and a.kind in kinds):
+                deny.append(f"agent {req.x_agent_id} blocked on anomaly: {a.kind} ({a.detail})")
+                break
+
     if deny:
         return GuardDecision("deny", deny, asdict(req))
     if not reasons:
@@ -227,7 +250,8 @@ def validate_policy(policy: dict) -> list[str]:
         "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
         "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
         "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
-        "x402_resources", "content_guard",
+        "x402_resources", "content_guard", "frozen_agents", "frozen_budgets",
+        "block_on_anomaly",
     }
     content_guard_keys = {"max_bytes", "deny_patterns", "deny_secrets"}
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
