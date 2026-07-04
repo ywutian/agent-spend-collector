@@ -161,7 +161,8 @@ class SpendStore:
     def reserve_and_record_gateway_decision(self, *, request_id: str, req, decision: str,
                                             reasons: list[str], route_type: str = "guard",
                                             route_id: str = "", ttl_seconds: int = 900,
-                                            cap: float | None = None) -> tuple[str, str]:
+                                            cap: float | None = None,
+                                            rate_cap: float | None = None) -> tuple[str, str]:
         """Atomically record a decision and, for allow, hold budget.
 
         Returns (decision, reservation_id). Duplicate request IDs return the
@@ -195,6 +196,24 @@ class SpendStore:
                         reservation_id = f"res:{uuid.uuid4().hex}"
                 else:
                     reservation_id = f"res:{uuid.uuid4().hex}"
+                if reservation_id and rate_cap is not None:
+                    # Atomic velocity re-check: recent spend + active holds in the last
+                    # hour. Makes the hourly cap race-safe like the budget cap, so a
+                    # concurrent burst can't slip past it.
+                    window = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+                    recent = self.db.execute(
+                        "SELECT COALESCE(SUM(billed_cost), 0) AS spent FROM spend_events "
+                        "WHERE x_budget_id = ? AND event_time > ?",
+                        (req.x_budget_id, window),
+                    ).fetchone()["spent"] or 0
+                    reserved_now = self.active_reservations_total(req.x_budget_id, now)
+                    if float(recent) + reserved_now + req.amount > float(rate_cap):
+                        final_decision = "deny"
+                        final_reasons = [
+                            f"budget {req.x_budget_id} hourly rate "
+                            f"{float(recent) + reserved_now + req.amount:.2f}/{float(rate_cap):.2f} exceeded"
+                        ]
+                        reservation_id = ""
                 if reservation_id:
                     expires_at = (
                         datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)

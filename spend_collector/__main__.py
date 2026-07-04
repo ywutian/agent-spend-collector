@@ -21,6 +21,7 @@ from .gateway import (
     decide,
     record_forwarded_spend,
     record_target_spend,
+    rate_cap_for_request,
     require_valid_policy,
     validate_policy as validate_policy_data,
 )
@@ -709,6 +710,7 @@ def _decide_and_record(store: SpendStore, policy: dict, req: GuardRequest, *,
     decision = decide(store, policy, req)
     ttl = int(policy.get("reservation_ttl_seconds", 900))
     cap = cap_for_request(policy, req)
+    rate_cap = rate_cap_for_request(policy, req)
     store.reserve_and_record_gateway_decision(
         request_id=request_id,
         req=req,
@@ -718,6 +720,7 @@ def _decide_and_record(store: SpendStore, policy: dict, req: GuardRequest, *,
         route_id=route_id,
         ttl_seconds=ttl,
         cap=cap,
+        rate_cap=rate_cap,
     )
     return store.gateway_decision_as_dict(request_id) or decision.as_dict()
 

@@ -306,6 +306,10 @@ def cap_for_request(policy: dict, req: GuardRequest) -> float | None:
     return _budget_cap(policy, req.x_agent_id, req.x_budget_id)
 
 
+def rate_cap_for_request(policy: dict, req: GuardRequest) -> float | None:
+    return _hourly_cap(policy, req.x_budget_id)
+
+
 def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_payload: dict):
     """Record a forwarded LLM call as a spend event from the response's token usage.
 
