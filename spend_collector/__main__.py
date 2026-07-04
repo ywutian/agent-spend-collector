@@ -190,15 +190,55 @@ def _format_alert(platform: str, text: str, structured: dict) -> dict:
     return structured  # generic: full {text, alerts, summary}
 
 
+def _triage_alerts(alerts: list, summary: dict) -> str | None:
+    """Opt-in AI triage: ask an LLM for the likely cause + one recommended action for
+    the high-severity alerts. Enabled by SPEND_TRIAGE_MODEL; uses an OpenAI-compatible
+    endpoint (SPEND_TRIAGE_BASE_URL, default OpenAI) with SPEND_TRIAGE_API_KEY or
+    OPENAI_API_KEY. Point the base URL at your own gateway to route (and record) the
+    triage call itself. Sends only alert metadata; best-effort, None on any failure.
+    """
+    model = os.environ.get("SPEND_TRIAGE_MODEL")
+    key = os.environ.get("SPEND_TRIAGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    high = [a for a in alerts if a.severity == "high"]
+    if not model or not key or not high:
+        return None
+    base = os.environ.get("SPEND_TRIAGE_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    facts = {"alerts": [_alert_row(a) for a in high],
+             "total_spend": summary.get("total_spend"), "budgets": summary.get("budgets")}
+    body = {
+        "model": model, "max_tokens": 160, "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "You are an agent-spend security analyst. Given "
+             "anomaly alerts (metadata only), reply in 2-3 sentences: the most likely cause "
+             "and one concrete recommended action. No preamble."},
+            {"role": "user", "content": json.dumps(facts)},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions", data=json.dumps(body).encode(),
+        headers={"content-type": "application/json", "authorization": f"Bearer {key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return (data["choices"][0]["message"]["content"] or "").strip() or None
+    except (urllib.error.URLError, OSError, KeyError, ValueError, IndexError):
+        return None
+
+
 def _notify_alerts(alerts: list, summary: dict) -> bool:
     """POST high-severity alerts to SPEND_ALERT_WEBHOOK (opt-in). Formats for Slack,
     Discord, Feishu/Lark, Teams, or a generic JSON body (auto-detected from the URL,
-    or SPEND_ALERT_FORMAT). Best-effort: metadata only, never breaks a run.
+    or SPEND_ALERT_FORMAT), and appends opt-in AI triage. Metadata only, never breaks a run.
     """
     url = os.environ.get("SPEND_ALERT_WEBHOOK")
     payload = _alert_payload(alerts, summary)
     if not url or payload is None:
         return False
+    triage = _triage_alerts(alerts, summary)
+    if triage:
+        payload = {**payload, "text": f"{payload['text']}\n\n\U0001f50e {triage}", "triage": triage}
     body = _format_alert(_alert_platform(url), payload["text"], payload)
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(),
