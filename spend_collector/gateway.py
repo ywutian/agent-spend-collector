@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -77,6 +77,26 @@ def _spent_for_budget(store: SpendStore, budget: str) -> float:
     return float(row["spent"] or 0)
 
 
+def _spent_since(store: SpendStore, budget: str, since_iso: str) -> float:
+    # ponytail: string compare of same-format ISO timestamps = chronological; gateway
+    # events all use datetime.now(utc).isoformat(), so this is correct for live spend.
+    row = store.db.execute(
+        "SELECT COALESCE(SUM(billed_cost), 0) AS spent FROM spend_events "
+        "WHERE x_budget_id = ? AND event_time > ?",
+        (budget, since_iso),
+    ).fetchone()
+    return float(row["spent"] or 0)
+
+
+def _hourly_cap(policy: dict, budget: str) -> float | None:
+    limits = policy.get("max_amount_per_hour")
+    if isinstance(limits, dict):
+        cap = limits.get(budget)
+    else:
+        cap = limits  # a bare number applies to every budget
+    return float(cap) if cap is not None else None
+
+
 def _budget_cap(policy: dict, agent: str, budget: str) -> float | None:
     agent_policy = _agent_policy(policy, agent)
     budgets = dict(policy.get("budgets", {}))
@@ -141,6 +161,15 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
         else:
             reasons.append(f"budget {req.x_budget_id} remaining {float(cap) - spent - reserved - req.amount:.2f}")
 
+    rate_cap = _hourly_cap(policy, req.x_budget_id)  # velocity: catch runaway loops fast
+    if rate_cap is not None:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        recent = _spent_since(store, req.x_budget_id, since)
+        if recent + req.amount > rate_cap:
+            deny.append(f"budget {req.x_budget_id} hourly rate {recent + req.amount:.2f}/{rate_cap:.2f} exceeded")
+        else:
+            reasons.append(f"budget {req.x_budget_id} hourly {recent + req.amount:.2f}/{rate_cap:.2f}")
+
     merchant_key = req.merchant_key()
     allowed_merchants = set(_list(agent.get("merchants")) or _list(policy.get("merchants")))
     if allowed_merchants and merchant_key not in allowed_merchants:
@@ -161,8 +190,8 @@ def validate_policy(policy: dict) -> list[str]:
     errors: list[str] = []
     root_keys = {
         "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
-        "warn_new_merchants", "deny_new_merchants", "agents", "merchants",
-        "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
+        "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
+        "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
     }
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
     target_keys = {

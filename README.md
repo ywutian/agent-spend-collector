@@ -298,7 +298,7 @@ book covers common models and everything else prices at zero until added.
 | `adapters.py` | Normalizers: token usage / x402 settlements / Stripe events -> ledger rows |
 | `providers.py` | Curated provider catalog (LLM + tool APIs + payment rails) + usage-shape resolver |
 | `sources.py` | Live read-only pulls: Anthropic cost API, Base USDC logs, Stripe Events API |
-| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
+| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants, off-hours activity |
 | `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
 | `report.py` | Zero-dependency static HTML dashboard |
 

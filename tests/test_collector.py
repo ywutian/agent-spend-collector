@@ -12,16 +12,17 @@ import time
 import urllib.error
 import urllib.request
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from spend_collector.__main__ import (
-    _alert_row, _is_event_stream, _load_budgets, _run_summary, _usage_body_from_sse,
-    _with_stream_usage, main, make_gateway_server,
+    _alert_payload, _alert_row, _is_event_stream, _load_budgets, _run_summary,
+    _usage_body_from_sse, _with_stream_usage, main, make_gateway_server,
 )
 from spend_collector.adapters import (
     _price, _tokencost_price, from_llm_usage, from_stripe_events, from_x402_settlements,
 )
-from spend_collector.detectors import run_all
+from spend_collector.detectors import Alert, off_hours_activity, run_all
 from spend_collector.gateway import (
     GuardRequest, decide, record_forwarded_spend, record_target_spend, validate_policy,
 )
@@ -916,6 +917,38 @@ class CollectorTest(unittest.TestCase):
         # no amount or no request id -> nothing recorded
         self.assertIsNone(record_target_spend(store, {"amount": 0}, "req-x"))
         self.assertIsNone(record_target_spend(store, {"amount": 1.0}, ""))
+
+    def test_off_hours_activity_detector(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        evs = [SpendEvent(f"day-{i}", f"2026-06-29T09:0{i}:00+00:00", "llm_token", "openai",
+                          "gpt-4o", 0.5, "USD", 100, "token", "night-bot", "team") for i in range(6)]
+        evs.append(SpendEvent("night", "2026-06-30T03:30:00+00:00", "llm_token", "openai",
+                              "gpt-4o", 5.0, "USD", 1000, "token", "night-bot", "team"))
+        store.ingest(evs)
+        alerts = off_hours_activity(store)
+        self.assertTrue(any(a.kind == "off_hours_activity" and a.subject == "night-bot" for a in alerts))
+
+    def test_gateway_hourly_rate_cap_denies_burst(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        store.ingest([SpendEvent("r1", datetime.now(timezone.utc).isoformat(), "llm_token",
+                     "openai", "gpt-4o", 4.0, "USD", 100, "token", "bot", "team-x")])
+        policy = {"max_amount_per_hour": {"team-x": 5.0}}
+        allow = decide(store, policy, GuardRequest(x_agent_id="bot", rail="llm_token", amount=0.5, x_budget_id="team-x"))
+        self.assertEqual(allow.decision, "allow")   # 4 + 0.5 <= 5
+        deny = decide(store, policy, GuardRequest(x_agent_id="bot", rail="llm_token", amount=2.0, x_budget_id="team-x"))
+        self.assertEqual(deny.decision, "deny")     # 4 + 2 > 5
+        self.assertTrue(any("hourly rate" in r for r in deny.reasons))
+
+    def test_alert_payload_only_for_high_severity(self) -> None:
+        warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
+        highs = [Alert("spend_spike", "bot", "big charge", "high", 9.9)]
+        self.assertIsNone(_alert_payload(warns, {"total_spend": 1}))
+        payload = _alert_payload(highs, {"total_spend": 9.9})
+        self.assertIsNotNone(payload)
+        self.assertIn("spend_spike", payload["text"])
+        self.assertEqual(len(payload["alerts"]), 1)
 
     def test_provider_catalog_and_usage_shapes(self) -> None:
         # usage_tokens spans the four LLM response families

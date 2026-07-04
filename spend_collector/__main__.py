@@ -144,6 +144,35 @@ def _write_json_artifact(path: str | Path, data) -> None:
         f.write("\n")
 
 
+def _alert_payload(alerts: list, summary: dict) -> dict | None:
+    """Slack-compatible / generic JSON for the high-severity alerts, or None."""
+    high = [a for a in alerts if a.severity == "high"]
+    if not high:
+        return None
+    lines = "\n".join(f"[{a.severity}] {a.kind} {a.subject}: {a.detail}" for a in high)
+    return {"text": f"agent-spend: {len(high)} high alert(s)\n{lines}",
+            "alerts": [_alert_row(a) for a in high], "summary": summary}
+
+
+def _notify_alerts(alerts: list, summary: dict) -> bool:
+    """POST high-severity alerts to SPEND_ALERT_WEBHOOK (opt-in, Slack-compatible).
+    Best-effort: sends only alert metadata (no prompts/keys) and never breaks a run.
+    """
+    url = os.environ.get("SPEND_ALERT_WEBHOOK")
+    payload = _alert_payload(alerts, summary)
+    if not url or payload is None:
+        return False
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Path = ".") -> None:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -162,9 +191,12 @@ def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Pat
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(render(store, budgets, alerts))
     print(f"\nWrote {report_path}  (open in a browser)")
+    summary = _run_summary(store, alerts, budgets)
     _write_json_artifact(alerts_path, [_alert_row(a) for a in alerts])
-    _write_json_artifact(summary_path, _run_summary(store, alerts, budgets))
+    _write_json_artifact(summary_path, summary)
     print(f"Wrote {alerts_path} and {summary_path}")
+    if _notify_alerts(alerts, summary):
+        print("Sent high-severity alerts to SPEND_ALERT_WEBHOOK")
 
 
 def demo(out_dir: str | Path = ".") -> None:
