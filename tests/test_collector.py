@@ -1642,6 +1642,21 @@ class CollectorTest(unittest.TestCase):
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=2)
             self.assertEqual(err.exception.code, 401)
 
+    def test_hourly_rate_cap_is_atomic(self) -> None:
+        # the velocity cap is re-checked inside the reservation transaction, counting
+        # active holds -- so a second concurrent allow can't slip past it.
+        store = SpendStore()
+        self.addCleanup(store.close)
+        req = GuardRequest(x_agent_id="bot", rail="llm_token", amount=3.0, x_budget_id="b")
+        d1, res1 = store.reserve_and_record_gateway_decision(
+            request_id="r1", req=req, decision="allow", reasons=["ok"], rate_cap=5.0)
+        self.assertEqual(d1, "allow")
+        self.assertTrue(res1)
+        d2, res2 = store.reserve_and_record_gateway_decision(  # 3 held + 3 asked > 5
+            request_id="r2", req=req, decision="allow", reasons=["ok"], rate_cap=5.0)
+        self.assertEqual(d2, "deny")
+        self.assertFalse(res2)
+
 
 if __name__ == "__main__":
     unittest.main()
