@@ -22,7 +22,9 @@ from spend_collector.adapters import (
     _price, _tokencost_price, from_llm_usage, from_stripe_events, from_x402_settlements,
 )
 from spend_collector.detectors import run_all
-from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend, validate_policy
+from spend_collector.gateway import (
+    GuardRequest, decide, record_forwarded_spend, record_target_spend, validate_policy,
+)
 from spend_collector.providers import KNOWN_PROVIDERS, llm_provider, usage_tokens
 from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
@@ -897,6 +899,23 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(event.consumed_quantity, 1500)
         self.assertEqual(event.service_name, "gemini-2.5-flash")
         self.assertGreater(event.billed_cost, 0)
+
+    def test_gateway_records_target_tool_spend(self) -> None:
+        # non-LLM tools have no token usage -> record the flat per-call amount
+        store = SpendStore()
+        self.addCleanup(store.close)
+        guard_payload = {"agent": "research-bot", "budget": "team", "rail": "api",
+                         "provider": "deepgram", "service": "deepgram", "amount": 0.0043}
+        event = record_target_spend(store, guard_payload, "req-tool-1")
+        self.assertIsNotNone(event)
+        self.assertEqual(event.rail, "api")
+        self.assertEqual(event.provider_name, "deepgram")
+        self.assertEqual(event.pricing_unit, "call")
+        self.assertAlmostEqual(event.billed_cost, 0.0043)
+        self.assertAlmostEqual(store.total(), 0.0043)
+        # no amount or no request id -> nothing recorded
+        self.assertIsNone(record_target_spend(store, {"amount": 0}, "req-x"))
+        self.assertIsNone(record_target_spend(store, {"amount": 1.0}, ""))
 
     def test_provider_catalog_and_usage_shapes(self) -> None:
         # usage_tokens spans the four LLM response families

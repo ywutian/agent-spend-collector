@@ -314,3 +314,37 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
     )
     store.ingest([event])
     return event
+
+
+def record_target_spend(store: SpendStore, guard_payload: dict, request_id: str):
+    """Record a forwarded non-LLM tool/API call. These meter differently per vendor
+    (audio seconds, characters, pages, per-call), so there is no universal usage to
+    parse -- we record the policy's flat per-call `amount` and release the hold.
+    For exact metered cost, add a per-tool extractor or reconcile from billing.
+    """
+    amount = float(guard_payload.get("amount", 0) or 0)
+    if amount <= 0 or not request_id:
+        return None
+    provider = str(guard_payload.get("provider", "tool"))
+    service = str(guard_payload.get("service") or guard_payload.get("merchant") or "tool")
+    event = SpendEvent(
+        event_id=f"gw:target:{request_id}",
+        event_time=datetime.now(tz=timezone.utc).isoformat(),
+        rail=str(guard_payload.get("rail", "api")),
+        provider_name=provider,
+        service_name=service,
+        billed_cost=amount,
+        billing_currency="USD",
+        consumed_quantity=1,
+        pricing_unit="call",
+        x_agent_id=str(guard_payload.get("agent", "unknown")),
+        x_budget_id=str(guard_payload.get("budget", "default")),
+        x_session_id=str(guard_payload.get("session", "")),
+        x_merchant_id=str(guard_payload.get("merchant", "")),
+        x_receipt_ref=request_id,
+        x_source_event=source_ref(provider, {"target": service, "amount": amount, "request_id": request_id}),
+        charge_category="Purchase",
+    )
+    store.ingest([event])
+    store.release_reservation(request_id)
+    return event

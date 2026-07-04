@@ -20,6 +20,7 @@ from .gateway import (
     cap_for_request,
     decide,
     record_forwarded_spend,
+    record_target_spend,
     require_valid_policy,
     validate_policy as validate_policy_data,
 )
@@ -458,7 +459,8 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             }
             return target, guard_payload
 
-        def _forward(self, target: dict, payload: dict) -> None:
+        def _forward(self, target: dict, payload: dict,
+                     guard_payload: dict | None = None, request_id: str = "") -> None:
             merged_headers = dict(target.get("headers", {}))
             for header, env_name in target.get("headers_env", {}).items():
                 value = os.environ.get(str(env_name))
@@ -483,6 +485,9 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             try:
                 with urllib.request.urlopen(req, timeout=float(target.get("timeout", 30))) as resp:
                     self._send_upstream(resp)
+                if guard_payload is not None:  # record flat per-call spend, release the hold
+                    with SpendStore(str(db_path)) as store:
+                        record_target_spend(store, guard_payload, request_id)
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
@@ -608,7 +613,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                     if not decision["allowed"]:
                         self._send(403, decision)
                         return
-                    self._forward(target, payload)
+                    self._forward(target, payload, guard_payload, decision.get("request_id", ""))
                     return
                 provider_route = self._provider_route(policy)
                 if provider_route:
