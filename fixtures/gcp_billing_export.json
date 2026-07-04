@@ -1,0 +1,60 @@
+[
+  {
+    "usage_start_time": "2026-06-29T01:00:00Z",
+    "project": {
+      "id": "agent-prod",
+      "name": "Agent Production"
+    },
+    "service": {
+      "description": "Cloud Run"
+    },
+    "sku": {
+      "description": "CPU Allocation Time"
+    },
+    "cost": 3.21,
+    "currency": "USD",
+    "usage": {
+      "amount": 12.5,
+      "unit": "seconds"
+    },
+    "labels": [
+      {
+        "key": "agent_id",
+        "value": "research-bot"
+      },
+      {
+        "key": "budget_id",
+        "value": "team-research"
+      }
+    ]
+  },
+  {
+    "usage_start_time": "2026-06-29T02:00:00Z",
+    "project": {
+      "id": "agent-prod",
+      "name": "Agent Production"
+    },
+    "service": {
+      "description": "BigQuery"
+    },
+    "sku": {
+      "description": "Analysis"
+    },
+    "cost": 1.44,
+    "currency": "USD",
+    "usage": {
+      "amount": 1.7,
+      "unit": "gibibyte"
+    },
+    "labels": [
+      {
+        "key": "agent_id",
+        "value": "ops-bot"
+      },
+      {
+        "key": "budget_id",
+        "value": "team-ops"
+      }
+    ]
+  }
+]

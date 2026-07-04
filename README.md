@@ -3,7 +3,7 @@
 **See and govern every dollar your AI agents spend, across every rail.**
 
 A free, read-only, cross-rail **agent spend collector**. It pulls what your agents
-spend (LLM token cost + x402 payments + direct USDC transfers + Stripe card payments),
+spend (LLM token cost + x402 payments + direct USDC transfers + AWS/GCP cloud cost + Stripe card payments),
 normalizes it into **one [FOCUS](https://focus.finops.org/)-shaped ledger**, and
 flags anomalies: runaway loops, cost spikes, budget burn. **It never touches your
 money** (read-only), so it clears security review on day one.
@@ -158,6 +158,7 @@ gateway and give the agent a gateway token:
 
 ```bash
 export OPENAI_API_KEY=sk-real-provider-key
+export OPENROUTER_API_KEY=sk-or-real-provider-key
 export SPEND_GATEWAY_TOKEN=dev-gateway-token
 python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
 ```
@@ -170,8 +171,18 @@ api_key = dev-gateway-token
 headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
 ```
 
-The gateway checks policy, replaces the gateway token with `OPENAI_API_KEY`, and
-forwards the original request to OpenAI only when allowed.
+For OpenRouter, use the same SDK shape and change only the provider path:
+
+```text
+base_url = http://127.0.0.1:8787/openrouter/v1
+api_key = dev-gateway-token
+headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
+```
+
+The gateway checks policy, replaces the gateway token with the provider key, and
+forwards the original request only when allowed. OpenRouter responses include
+usage and cost metadata, so successful gateway calls are recorded with the
+actual OpenRouter charge instead of a local price estimate.
 
 Validate and audit the gateway config before starting it:
 
@@ -241,6 +252,23 @@ Single-rail pulls still work:
 export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
 python3 -m spend_collector pull --db spend.db --days 7 --out-dir artifacts
 
+# OpenRouter generation metadata by generation id
+export OPENROUTER_API_KEY=sk-or-...
+python3 -m spend_collector pull-openrouter --generation-id gen_... --db spend.db --out-dir artifacts
+
+# AWS cloud cost: Cost Explorer grouped by cost allocation tags
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
+python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id --db spend.db --out-dir artifacts
+
+# GCP cloud cost: BigQuery Cloud Billing export rows saved as JSON/NDJSON/CSV
+python3 -m spend_collector pull-gcp-billing-file \
+  --billing-export-file gcp-billing-export.ndjson \
+  --label-agent agent_id \
+  --label-budget budget_id \
+  --db spend.db \
+  --out-dir artifacts
+
 # x402 payments: USDC settlements into your merchant address on Base
 python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
 
@@ -281,11 +309,15 @@ spend.db --out-dir artifacts` re-renders the evidence page.
 Attribution:
 
 - LLM: one API key per agent.
+- OpenRouter: gateway headers (`X-Agent-ID`, `X-Budget-ID`) for live calls; generation metadata `external_user` for post-hoc pulls.
+- AWS: Cost Allocation Tags, default `agent_id` and `budget_id`.
+- GCP: Cloud Billing export labels, default `agent_id` and `budget_id`.
 - x402: payer wallet.
 - USDC: payer wallet by default; map wallet addresses to agents/budgets upstream.
 - Stripe: `PaymentIntent.metadata.agent_id` and `metadata.budget_id`.
 
-OpenAI and OpenRouter can follow the Anthropic cost-report shape.
+OpenAI can follow the Anthropic cost-report shape. OpenRouter is easiest through
+the gateway because responses include usage and cost metadata.
 
 ## What's inside
 
@@ -293,8 +325,8 @@ OpenAI and OpenRouter can follow the Anthropic cost-report shape.
 |---|---|
 | `schema.py` | FOCUS-shaped `SpendEvent` (one row shape for every rail) |
 | `store.py` | Append-only, idempotent SQLite ledger + summaries |
-| `adapters.py` | Normalizers: token usage / x402 settlements / USDC transfers / Stripe events -> ledger rows |
-| `sources.py` | Live read-only pulls: Anthropic cost API, Base USDC logs, Stripe Events API |
+| `adapters.py` | Normalizers: token usage / cloud cost / x402 settlements / USDC transfers / Stripe events -> ledger rows |
+| `sources.py` | Live read-only pulls: Anthropic/OpenAI cost APIs, OpenRouter generation metadata, AWS Cost Explorer, GCP Billing Export files, Base USDC logs, Stripe Events API |
 | `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
 | `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
 | `report.py` | Zero-dependency static HTML dashboard |
@@ -318,9 +350,11 @@ detect -> inline -> on-chain
 2. Done: real Anthropic cost pull (`pull`).
 3. Done: real x402 pull, on-chain USDC on Base (`pull-x402`).
 4. Done: direct USDC stablecoin rail on Base (`pull-usdc`).
-5. Done: Stripe Events rail, token + crypto + card in one ledger (`pull-stripe`).
-6. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-7. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
-8. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
+5. Done: AWS cloud cost rail via Cost Explorer (`pull-aws`).
+6. Done: GCP cloud cost rail via Billing Export files (`pull-gcp-billing-file`).
+7. Done: Stripe Events rail, token + crypto + cloud + card in one ledger (`pull-stripe`).
+8. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
+9. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
+10. Next: Azure cloud rail, LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
 Requires Python 3.10+. No dependencies. License: MIT.

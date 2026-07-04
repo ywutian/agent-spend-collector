@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, fields
 
-RAILS = ("llm_token", "api_x402", "card", "stablecoin")
+RAILS = ("llm_token", "api_x402", "card", "stablecoin", "cloud")
 
 
 @dataclass(frozen=True)

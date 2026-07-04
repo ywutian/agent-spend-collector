@@ -26,7 +26,10 @@ from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
 from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
-    _env_int, _request_json, decode_transfer_log, fetch_openai_costs, from_llm_cost_rows,
+    _aws_sigv4_headers, _env_int, _request_json, decode_transfer_log,
+    fetch_aws_cost_and_usage, fetch_openai_costs, fetch_openrouter_generations,
+    from_aws_cost_rows, from_gcp_billing_rows, from_llm_cost_rows,
+    from_openrouter_generation_rows, load_gcp_billing_export,
 )
 from spend_collector.store import SpendStore
 
@@ -940,6 +943,123 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(rows[0]["api_key_id"], "key-1")
         self.assertEqual(rows[0]["model"], "gpt-5, input")
 
+    def test_fetch_openrouter_generations_parses_metadata_envelope(self) -> None:
+        import spend_collector.sources as sources
+        canned = {"data": {
+            "id": "gen-1",
+            "created_at": "2026-06-30T00:00:00+00:00",
+            "model": "openai/gpt-4o-mini",
+            "provider_name": "OpenAI",
+            "tokens_prompt": 10,
+            "tokens_completion": 5,
+            "total_cost": 0.0012,
+            "external_user": "agent-key",
+        }}
+        original = sources._request_json
+        sources._request_json = lambda req: canned
+        try:
+            rows = fetch_openrouter_generations("sk-or-test", ["gen-1"])
+        finally:
+            sources._request_json = original
+
+        self.assertEqual(rows, [canned["data"]])
+        events = from_openrouter_generation_rows(
+            rows,
+            key_to_agent={"agent-key": "router-bot"},
+            key_to_budget={"agent-key": "team-router"},
+        )
+        self.assertEqual(events[0].provider_name, "openrouter")
+        self.assertEqual(events[0].service_name, "openai/gpt-4o-mini")
+        self.assertEqual(events[0].billed_cost, 0.0012)
+        self.assertEqual(events[0].consumed_quantity, 15)
+        self.assertEqual(events[0].x_agent_id, "router-bot")
+        self.assertEqual(events[0].x_budget_id, "team-router")
+
+    def test_aws_sigv4_headers_include_authorization(self) -> None:
+        from datetime import datetime, timezone
+        headers = _aws_sigv4_headers(
+            url="https://ce.us-east-1.amazonaws.com",
+            body=b"{}",
+            access_key="AKIDEXAMPLE",
+            secret_key="secret",
+            region="us-east-1",
+            service="ce",
+            target="AWSInsightsIndexService.GetCostAndUsage",
+            session_token="token",
+            now=datetime(2026, 6, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertIn("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/", headers["authorization"])
+        self.assertEqual(headers["x-amz-security-token"], "token")
+        self.assertEqual(headers["x-amz-target"], "AWSInsightsIndexService.GetCostAndUsage")
+
+    def test_fetch_aws_cost_and_usage_maps_tag_groups_to_cloud_rows(self) -> None:
+        import spend_collector.sources as sources
+        canned = {"ResultsByTime": [{
+            "TimePeriod": {"Start": "2026-06-29", "End": "2026-06-30"},
+            "Groups": [{
+                "Keys": ["agent_id$research-bot", "budget_id$team-research"],
+                "Metrics": {"UnblendedCost": {"Amount": "1.23", "Unit": "USD"}},
+            }],
+        }]}
+        original = sources._request_json
+        sources._request_json = lambda req: canned
+        try:
+            rows = fetch_aws_cost_and_usage(
+                "AKID",
+                "SECRET",
+                days=1,
+                tag_agent="agent_id",
+                tag_budget="budget_id",
+            )
+        finally:
+            sources._request_json = original
+
+        self.assertEqual(rows[0]["agent_id"], "research-bot")
+        self.assertEqual(rows[0]["budget_id"], "team-research")
+        self.assertEqual(rows[0]["amount"], 1.23)
+        events = from_aws_cost_rows(rows)
+        self.assertEqual(events[0].rail, "cloud")
+        self.assertEqual(events[0].provider_name, "aws")
+        self.assertEqual(events[0].billed_cost, 1.23)
+        self.assertEqual(events[0].x_agent_id, "research-bot")
+        self.assertEqual(events[0].x_budget_id, "team-research")
+
+    def test_gcp_billing_export_maps_labels_to_cloud_rows(self) -> None:
+        rows = load_gcp_billing_export(FIXTURES / "gcp_billing_export.json")
+        events = from_gcp_billing_rows(rows)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].rail, "cloud")
+        self.assertEqual(events[0].provider_name, "gcp")
+        self.assertEqual(events[0].service_name, "Cloud Run")
+        self.assertEqual(events[0].billed_cost, 3.21)
+        self.assertEqual(events[0].consumed_quantity, 12.5)
+        self.assertEqual(events[0].pricing_unit, "seconds")
+        self.assertEqual(events[0].x_agent_id, "research-bot")
+        self.assertEqual(events[0].x_budget_id, "team-research")
+        self.assertEqual(events[0].x_merchant_id, "agent-prod")
+
+    def test_cli_pull_gcp_billing_file_ingests_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "spend.db"
+            with contextlib.redirect_stdout(io.StringIO()):
+                main([
+                    "pull-gcp-billing-file",
+                    "--db", str(db_path),
+                    "--out-dir", tmp,
+                    "--billing-export-file", str(FIXTURES / "gcp_billing_export.json"),
+                ])
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                row = store.db.execute(
+                    "SELECT rail, provider_name, SUM(billed_cost) AS spend FROM spend_events GROUP BY rail, provider_name"
+                ).fetchone()
+
+        self.assertEqual(row["rail"], "cloud")
+        self.assertEqual(row["provider_name"], "gcp")
+        self.assertAlmostEqual(row["spend"], 4.65)
+
     def test_price_longest_prefix_match(self) -> None:
         self.assertAlmostEqual(_price("gpt-4o", 1_000_000, 0), 2.5)              # exact
         self.assertAlmostEqual(_price("gpt-4o-2024-08-06", 1_000_000, 0), 2.5)   # dated -> prefix
@@ -964,6 +1084,32 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(store.total(), event.billed_cost)
         # streamed body with no usage records nothing
         self.assertIsNone(record_forwarded_spend(store, b"data: [DONE]\n", provider, guard_payload))
+
+    def test_gateway_records_openrouter_usage_cost(self) -> None:
+        raw = json.dumps({
+            "id": "gen-1",
+            "model": "anthropic/claude-sonnet-5",
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "total_tokens": 1500,
+                "cost": 0.0123,
+            },
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(
+            store,
+            raw,
+            {"provider": "openrouter"},
+            {"agent": "router-bot", "budget": "team-router"},
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.provider_name, "openrouter")
+        self.assertEqual(event.billed_cost, 0.0123)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertEqual(store.total(), 0.0123)
 
     def test_gateway_records_anthropic_usage_shape(self) -> None:
         # Anthropic returns input_tokens/output_tokens, not prompt_/completion_tokens

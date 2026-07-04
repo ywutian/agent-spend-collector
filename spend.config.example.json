@@ -29,6 +29,27 @@
       "provider": "anthropic",
       "api_key_env": "ANTHROPIC_ADMIN_KEY"
     },
+    "openrouter": {
+      "enabled": false,
+      "provider": "openrouter",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "generation_ids": []
+    },
+    "aws": {
+      "enabled": false,
+      "days": 7,
+      "access_key_env": "AWS_ACCESS_KEY_ID",
+      "secret_key_env": "AWS_SECRET_ACCESS_KEY",
+      "session_token_env": "AWS_SESSION_TOKEN",
+      "tag_agent": "agent_id",
+      "tag_budget": "budget_id"
+    },
+    "gcp": {
+      "enabled": false,
+      "billing_export_file": "gcp-billing-export.ndjson",
+      "label_agent": "agent_id",
+      "label_budget": "budget_id"
+    },
     "x402": {
       "enabled": true,
       "pay_to": "0xYourX402ReceivingAddress"

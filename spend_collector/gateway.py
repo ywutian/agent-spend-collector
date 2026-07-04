@@ -295,6 +295,12 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
     # OpenAI: prompt_tokens/completion_tokens. Anthropic: input_tokens/output_tokens.
     prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
     completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    total = int(usage.get("total_tokens", prompt + completion) or prompt + completion)
+    billed_cost = (
+        float(usage["cost"])
+        if pname == "openrouter" and usage.get("cost") is not None
+        else _price(model, prompt, completion)
+    )
     rid = str(data.get("id") or f"{guard_payload.get('agent', 'agent')}:{prompt}:{completion}")
     event = SpendEvent(
         event_id=f"gw:{rid}",
@@ -302,9 +308,9 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         rail="llm_token",
         provider_name=pname,
         service_name=model,
-        billed_cost=_price(model, prompt, completion),
+        billed_cost=billed_cost,
         billing_currency="USD",
-        consumed_quantity=prompt + completion,
+        consumed_quantity=total,
         pricing_unit="token",
         x_agent_id=str(guard_payload.get("agent", "unknown")),
         x_budget_id=str(guard_payload.get("budget", "default")),

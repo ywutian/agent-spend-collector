@@ -130,7 +130,7 @@ def _section_metrics(store: SpendStore, alerts: list[Alert]) -> str:
         f"<div class='metric'><div class='label'>Agents</div><div class='value'>{agents}</div>"
         f"<div class='meta'>{events} spend events</div></div>"
         f"<div class='metric'><div class='label'>Rails</div><div class='value'>{rails}</div>"
-        "<div class='meta'>Token, API, card, stablecoin</div></div>"
+        "<div class='meta'>Token, API, card, stablecoin, cloud</div></div>"
         "</section>"
     )
 

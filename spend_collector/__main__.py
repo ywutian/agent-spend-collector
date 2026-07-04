@@ -97,6 +97,24 @@ def _enabled(cfg: dict, default: bool = True) -> bool:
     return bool(cfg.get("enabled", default))
 
 
+def _load_id_list(path: str | Path | None = None, values: list[str] | None = None) -> list[str]:
+    out = [str(v).strip() for v in (values or []) if str(v).strip()]
+    if not path:
+        return out
+    p = Path(path)
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        return out
+    if p.suffix.lower() == ".json":
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data = data.get("generation_ids") or data.get("ids") or []
+        out.extend(str(v).strip() for v in data if str(v).strip())
+    else:
+        out.extend(line.strip() for line in text.splitlines() if line.strip())
+    return out
+
+
 def _with_stream_usage(raw: bytes) -> bytes:
     """Streamed chat responses omit token usage, so streamed spend can't be priced.
     For a `stream: true` body, ask the provider to emit a final usage chunk
@@ -285,6 +303,74 @@ def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int 
         _finish_run(store, _load_budgets(), out_dir)
 
 
+def pull_openrouter(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
+                    generation_ids: list[str] | None = None,
+                    generation_ids_file: str | Path | None = None) -> None:
+    """Pull OpenRouter generation metadata by generation id."""
+    from .sources import env_openrouter_key, fetch_openrouter_generations, from_openrouter_generation_rows
+    key = env_openrouter_key()
+    if not key:
+        print("Set OPENROUTER_API_KEY to pull OpenRouter generation metadata:\n"
+              "  export OPENROUTER_API_KEY=sk-or-...\n"
+              "  python3 -m spend_collector pull-openrouter --generation-id gen_...")
+        sys.exit(1)
+    ids = _load_id_list(generation_ids_file, generation_ids)
+    if not ids:
+        print("Pass at least one OpenRouter generation id:\n"
+              "  python3 -m spend_collector pull-openrouter --generation-id gen_...\n"
+              "  python3 -m spend_collector pull-openrouter --generation-ids-file generations.txt")
+        sys.exit(1)
+    with SpendStore(str(db_path)) as store:
+        n = store.ingest(from_openrouter_generation_rows(fetch_openrouter_generations(key, ids)))
+        print(f"ingested {n} OpenRouter generations -> {db_path}")
+        _finish_run(store, _load_budgets(), out_dir)
+
+
+def pull_aws(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
+             tag_agent: str = "agent_id", tag_budget: str = "budget_id") -> None:
+    """Pull AWS Cost Explorer spend grouped by agent/budget cost allocation tags."""
+    from .sources import (
+        env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token,
+        fetch_aws_cost_and_usage, from_aws_cost_rows,
+    )
+    access_key = env_aws_access_key_id()
+    secret_key = env_aws_secret_access_key()
+    if not access_key or not secret_key:
+        print("Set AWS read-only Cost Explorer credentials:\n"
+              "  export AWS_ACCESS_KEY_ID=...\n"
+              "  export AWS_SECRET_ACCESS_KEY=...\n"
+              "  python3 -m spend_collector pull-aws")
+        sys.exit(1)
+    with SpendStore(str(db_path)) as store:
+        n = store.ingest(from_aws_cost_rows(fetch_aws_cost_and_usage(
+            access_key,
+            secret_key,
+            session_token=env_aws_session_token(),
+            days=days,
+            tag_agent=tag_agent,
+            tag_budget=tag_budget,
+        )))
+        print(f"ingested {n} AWS cost rows -> {db_path}")
+        _finish_run(store, _load_budgets(), out_dir)
+
+
+def pull_gcp_billing_file(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
+                          billing_export_file: str | Path | None = None,
+                          label_agent: str = "agent_id",
+                          label_budget: str = "budget_id") -> None:
+    """Pull GCP Cloud Billing export rows from a JSON/NDJSON/CSV file."""
+    from .sources import load_gcp_billing_export, from_gcp_billing_rows
+    if not billing_export_file:
+        print("Pass a GCP Billing Export file:\n"
+              "  python3 -m spend_collector pull-gcp-billing-file --billing-export-file gcp-billing.ndjson")
+        sys.exit(1)
+    with SpendStore(str(db_path)) as store:
+        rows = load_gcp_billing_export(billing_export_file)
+        n = store.ingest(from_gcp_billing_rows(rows, label_agent=label_agent, label_budget=label_budget))
+        print(f"ingested {n} GCP billing rows -> {db_path}")
+        _finish_run(store, _load_budgets(), out_dir)
+
+
 def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
               pay_to: str | None = None, lookback_blocks: int = 2000,
               wallet_map_path: str | Path | None = None) -> None:
@@ -350,9 +436,12 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
              out_dir: str | Path | None = None) -> None:
     """Pull every configured rail into one ledger, then render once."""
     from .sources import (
+        env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token,
         env_pay_to, env_usdc_pay_to, fetch_anthropic_cost_report,
-        fetch_base_usdc_transfers, fetch_openai_costs, fetch_stripe_payment_intent_events,
-        from_llm_cost_rows,
+        fetch_aws_cost_and_usage,
+        fetch_base_usdc_transfers, fetch_openai_costs, fetch_openrouter_generations,
+        fetch_stripe_payment_intent_events, from_aws_cost_rows, from_gcp_billing_rows,
+        from_llm_cost_rows, from_openrouter_generation_rows, load_gcp_billing_export,
     )
     config = _load_config(config_path)
     config_base = Path(config_path).resolve().parent if config_path else None
@@ -366,7 +455,17 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
         if _enabled(llm_cfg):
             provider = str(llm_cfg.get("provider", config.get("llm_provider", "anthropic")))
             days = int(llm_cfg.get("days", config.get("days", 7)))
-            if provider == "openai":
+            if provider == "openrouter":
+                key = _configured_env(llm_cfg, "OPENROUTER_API_KEY")
+                ids = _load_id_list(llm_cfg.get("generation_ids_file"), llm_cfg.get("generation_ids") or [])
+                if key and ids:
+                    n = store.ingest(from_openrouter_generation_rows(fetch_openrouter_generations(key, ids)))
+                    print(f"ingested {n} OpenRouter generations -> {db_path}")
+                elif not key:
+                    print("skipped llm/openrouter: set OPENROUTER_API_KEY or rails.llm.api_key_env")
+                else:
+                    print("skipped llm/openrouter: set rails.llm.generation_ids or generation_ids_file")
+            elif provider == "openai":
                 key = _configured_env(llm_cfg, "OPENAI_ADMIN_KEY")
                 if key:
                     n = store.ingest(from_llm_cost_rows(fetch_openai_costs(key, days=days)))
@@ -380,6 +479,55 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
                     print(f"ingested {n} anthropic cost rows -> {db_path}")
                 else:
                     print("skipped llm/anthropic: set ANTHROPIC_ADMIN_KEY or rails.llm.api_key_env")
+
+        openrouter_cfg = _rail_config(config, "openrouter")
+        if _enabled(openrouter_cfg, default=False):
+            key = _configured_env(openrouter_cfg, "OPENROUTER_API_KEY")
+            ids = _load_id_list(
+                openrouter_cfg.get("generation_ids_file"),
+                openrouter_cfg.get("generation_ids") or [],
+            )
+            if key and ids:
+                n = store.ingest(from_openrouter_generation_rows(fetch_openrouter_generations(key, ids)))
+                print(f"ingested {n} OpenRouter generations -> {db_path}")
+            elif not key:
+                print("skipped openrouter: set OPENROUTER_API_KEY or rails.openrouter.api_key_env")
+            else:
+                print("skipped openrouter: set rails.openrouter.generation_ids or generation_ids_file")
+
+        aws_cfg = _rail_config(config, "aws") or _rail_config(config, "cloud")
+        if _enabled(aws_cfg, default=False):
+            access_key = os.environ.get(str(aws_cfg.get("access_key_env", "AWS_ACCESS_KEY_ID")))
+            secret_key = os.environ.get(str(aws_cfg.get("secret_key_env", "AWS_SECRET_ACCESS_KEY")))
+            session_token = os.environ.get(str(aws_cfg.get("session_token_env", "AWS_SESSION_TOKEN")))
+            if access_key and secret_key:
+                n = store.ingest(from_aws_cost_rows(fetch_aws_cost_and_usage(
+                    access_key,
+                    secret_key,
+                    session_token=session_token or env_aws_session_token(),
+                    days=int(aws_cfg.get("days", config.get("days", 7))),
+                    tag_agent=str(aws_cfg.get("tag_agent", "agent_id")),
+                    tag_budget=str(aws_cfg.get("tag_budget", "budget_id")),
+                )))
+                print(f"ingested {n} AWS cost rows -> {db_path}")
+            else:
+                print("skipped aws: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or rails.aws *_env")
+
+        gcp_cfg = _rail_config(config, "gcp")
+        if _enabled(gcp_cfg, default=False):
+            export_file = gcp_cfg.get("billing_export_file")
+            if export_file:
+                export_path = Path(export_file)
+                if config_base is not None and not export_path.is_absolute():
+                    export_path = config_base / export_path
+                n = store.ingest(from_gcp_billing_rows(
+                    load_gcp_billing_export(export_path),
+                    label_agent=str(gcp_cfg.get("label_agent", "agent_id")),
+                    label_budget=str(gcp_cfg.get("label_budget", "budget_id")),
+                ))
+                print(f"ingested {n} GCP billing rows -> {db_path}")
+            else:
+                print("skipped gcp: set rails.gcp.billing_export_file")
 
         x402_cfg = _rail_config(config, "x402")
         if _enabled(x402_cfg):
@@ -838,6 +986,29 @@ def _parser() -> argparse.ArgumentParser:
     pull_p.add_argument("--provider", default="anthropic", choices=["anthropic", "openai"],
                         help="LLM cost provider")
 
+    openrouter_p = sub.add_parser("pull-openrouter", parents=[common],
+                                  help="pull OpenRouter generation metadata by id")
+    openrouter_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    openrouter_p.add_argument("--generation-id", action="append", default=[],
+                              help="OpenRouter generation id; may be repeated")
+    openrouter_p.add_argument("--generation-ids-file",
+                              help="text file or JSON file containing generation ids")
+
+    aws_p = sub.add_parser("pull-aws", parents=[common],
+                           help="pull AWS Cost Explorer spend grouped by tags")
+    aws_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    aws_p.add_argument("--days", type=int, default=7, help="days of AWS cost history to request")
+    aws_p.add_argument("--tag-agent", default="agent_id", help="AWS cost allocation tag for agent id")
+    aws_p.add_argument("--tag-budget", default="budget_id", help="AWS cost allocation tag for budget id")
+
+    gcp_p = sub.add_parser("pull-gcp-billing-file", parents=[common],
+                           help="pull GCP Cloud Billing export rows from a file")
+    gcp_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    gcp_p.add_argument("--billing-export-file", required=True,
+                       help="BigQuery billing export rows as JSON, NDJSON, or CSV")
+    gcp_p.add_argument("--label-agent", default="agent_id", help="GCP label for agent id")
+    gcp_p.add_argument("--label-budget", default="budget_id", help="GCP label for budget id")
+
     all_p = sub.add_parser("pull-all", parents=[common],
                            help="pull every configured rail from one JSON config")
     all_p.add_argument("--config", default="spend.config.json",
@@ -911,6 +1082,14 @@ def main(argv: list[str] | None = None) -> None:
         demo(args.out_dir)
     elif cmd == "pull":
         pull(args.db, args.out_dir, args.days, args.provider)
+    elif cmd == "pull-openrouter":
+        pull_openrouter(args.db, args.out_dir, args.generation_id, args.generation_ids_file)
+    elif cmd == "pull-aws":
+        pull_aws(args.db, args.out_dir, args.days, args.tag_agent, args.tag_budget)
+    elif cmd == "pull-gcp-billing-file":
+        pull_gcp_billing_file(
+            args.db, args.out_dir, args.billing_export_file, args.label_agent, args.label_budget,
+        )
     elif cmd == "pull-all":
         pull_all(args.config, args.db, args.out_dir)
     elif cmd == "pull-x402":

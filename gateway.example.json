@@ -1,5 +1,5 @@
 {
-  "rails": ["llm_token", "api_x402", "stablecoin", "card"],
+  "rails": ["llm_token", "api_x402", "stablecoin", "cloud", "card"],
   "budgets": {
     "team-research": 10.0,
     "team-support": 8.0,
@@ -9,6 +9,7 @@
   "max_amount_by_rail": {
     "api_x402": 3.0,
     "stablecoin": 25.0,
+    "cloud": 50.0,
     "card": 10.0
   },
   "warn_new_merchants": true,
@@ -16,7 +17,7 @@
   "agents": {
     "research-bot": {
       "budgets": ["team-research"],
-      "rails": ["llm_token", "api_x402", "stablecoin"],
+      "rails": ["llm_token", "api_x402", "stablecoin", "cloud"],
       "max_amount": 3.0
     },
     "support-bot": {
@@ -31,6 +32,16 @@
       "rail": "llm_token",
       "provider": "openai",
       "merchant": "openai",
+      "service_from_body": "model",
+      "amount": 0.25,
+      "budget": "team-research"
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "rail": "llm_token",
+      "provider": "openrouter",
+      "merchant": "openrouter",
       "service_from_body": "model",
       "amount": 0.25,
       "budget": "team-research"

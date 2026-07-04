@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import hmac
+import csv
 import time
 import urllib.error
 import urllib.parse
@@ -143,6 +146,340 @@ def fetch_openai_costs(admin_key: str, days: int = 7) -> list[dict]:
                 "provider": "openai",
             })
     return rows
+
+
+# --- LLM token cost (OpenRouter generation metadata) ---
+_OPENROUTER_GENERATION_URL = "https://openrouter.ai/api/v1/generation"
+
+
+def env_openrouter_key() -> str | None:
+    return os.environ.get("OPENROUTER_API_KEY")
+
+
+def fetch_openrouter_generations(api_key: str, generation_ids: list[str]) -> list[dict]:
+    """Pull OpenRouter generation metadata by id.
+
+    OpenRouter exposes generation cost/token metadata per generation id rather
+    than as a broad account export. For live gateway traffic, prefer recording
+    the `usage` object returned with the response.
+    """
+    rows: list[dict] = []
+    for generation_id in generation_ids:
+        params = urllib.parse.urlencode({"id": generation_id})
+        req = urllib.request.Request(
+            f"{_OPENROUTER_GENERATION_URL}?{params}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        data = _request_json(req)
+        row = data.get("data", data)
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def from_openrouter_generation_rows(rows, key_to_agent=None, key_to_budget=None) -> list[SpendEvent]:
+    """OpenRouter /generation rows -> SpendEvents."""
+    key_to_agent = key_to_agent or {}
+    key_to_budget = key_to_budget or {}
+    out = []
+    for r in rows:
+        generation_id = str(r.get("id") or r.get("upstream_id") or r.get("request_id"))
+        model = str(r.get("model") or r.get("router") or "openrouter")
+        external_user = str(r.get("external_user") or r.get("session_id") or "openrouter")
+        prompt = int(r.get("tokens_prompt", r.get("native_tokens_prompt", 0)) or 0)
+        completion = int(r.get("tokens_completion", r.get("native_tokens_completion", 0)) or 0)
+        total = prompt + completion
+        out.append(SpendEvent(
+            event_id=f"openrouter:{generation_id}",
+            event_time=str(r.get("created_at") or datetime.now(tz=timezone.utc).isoformat()),
+            rail="llm_token",
+            provider_name="openrouter",
+            service_name=model,
+            billed_cost=float(r.get("total_cost", r.get("usage", 0)) or 0),
+            billing_currency="USD",
+            consumed_quantity=total,
+            pricing_unit="token",
+            x_agent_id=key_to_agent.get(external_user, external_user),
+            x_budget_id=key_to_budget.get(external_user, "default"),
+            x_session_id=str(r.get("session_id") or ""),
+            x_merchant_id=str(r.get("provider_name") or "openrouter"),
+            x_receipt_ref=generation_id,
+            x_source_event=source_ref("openrouter", r),
+        ))
+    return out
+
+
+# --- Cloud cost (AWS Cost Explorer) ---
+_AWS_CE_URL = "https://ce.us-east-1.amazonaws.com"
+_AWS_CE_TARGET = "AWSInsightsIndexService.GetCostAndUsage"
+
+
+def env_aws_access_key_id() -> str | None:
+    return os.environ.get("AWS_ACCESS_KEY_ID")
+
+
+def env_aws_secret_access_key() -> str | None:
+    return os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+
+def env_aws_session_token() -> str | None:
+    return os.environ.get("AWS_SESSION_TOKEN")
+
+
+def _aws_signing_key(secret_key: str, date_stamp: str, region: str, service: str) -> bytes:
+    key = ("AWS4" + secret_key).encode()
+    for value in (date_stamp, region, service, "aws4_request"):
+        key = hmac.new(key, value.encode(), hashlib.sha256).digest()
+    return key
+
+
+def _aws_sigv4_headers(
+    *,
+    url: str,
+    body: bytes,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    service: str,
+    target: str,
+    session_token: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    now = now or datetime.now(tz=timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    parsed = urllib.parse.urlsplit(url)
+    headers = {
+        "content-type": "application/x-amz-json-1.1",
+        "host": parsed.netloc,
+        "x-amz-date": amz_date,
+        "x-amz-target": target,
+    }
+    if session_token:
+        headers["x-amz-security-token"] = session_token
+    signed_headers = ";".join(sorted(k.lower() for k in headers))
+    canonical_headers = "".join(f"{k.lower()}:{headers[k].strip()}\n" for k in sorted(headers, key=str.lower))
+    canonical_request = "\n".join([
+        "POST",
+        parsed.path or "/",
+        parsed.query,
+        canonical_headers,
+        signed_headers,
+        hashlib.sha256(body).hexdigest(),
+    ])
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        scope,
+        hashlib.sha256(canonical_request.encode()).hexdigest(),
+    ])
+    signature = hmac.new(
+        _aws_signing_key(secret_key, date_stamp, region, service),
+        string_to_sign.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return headers
+
+
+def _aws_tag_value(value: str, tag_key: str | None = None) -> str:
+    value = str(value or "")
+    if "$" in value:
+        key, val = value.split("$", 1)
+        if tag_key is None or key == tag_key:
+            return val or "unknown"
+    if value.lower().startswith("no tag"):
+        return "unknown"
+    return value or "unknown"
+
+
+def fetch_aws_cost_and_usage(
+    access_key: str,
+    secret_key: str,
+    *,
+    session_token: str | None = None,
+    days: int = 7,
+    region: str = "us-east-1",
+    tag_agent: str = "agent_id",
+    tag_budget: str = "budget_id",
+) -> list[dict]:
+    """Pull AWS Cost Explorer daily unblended cost grouped by agent/budget tags."""
+    end = date.today()
+    start = end - timedelta(days=days)
+    group_by = []
+    if tag_agent:
+        group_by.append({"Type": "TAG", "Key": tag_agent})
+    if tag_budget:
+        group_by.append({"Type": "TAG", "Key": tag_budget})
+    if not group_by:
+        group_by.append({"Type": "DIMENSION", "Key": "SERVICE"})
+    payload = {
+        "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+        "Granularity": "DAILY",
+        "Metrics": ["UnblendedCost"],
+        "GroupBy": group_by[:2],
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = _aws_sigv4_headers(
+        url=_AWS_CE_URL,
+        body=body,
+        access_key=access_key,
+        secret_key=secret_key,
+        region=region,
+        service="ce",
+        target=_AWS_CE_TARGET,
+        session_token=session_token,
+    )
+    req = urllib.request.Request(_AWS_CE_URL, data=body, headers=headers, method="POST")
+    data = _request_json(req)
+
+    rows: list[dict] = []
+    for bucket in data.get("ResultsByTime", []):
+        start_at = bucket.get("TimePeriod", {}).get("Start", start.isoformat())
+        end_at = bucket.get("TimePeriod", {}).get("End", end.isoformat())
+        groups = bucket.get("Groups") or []
+        if not groups:
+            amount = (bucket.get("Total", {}).get("UnblendedCost") or {}).get("Amount", 0)
+            unit = (bucket.get("Total", {}).get("UnblendedCost") or {}).get("Unit", "USD")
+            rows.append({
+                "start": start_at, "end": end_at, "amount": float(amount or 0),
+                "currency": unit, "service": "aws", "agent_id": "unknown",
+                "budget_id": "default",
+            })
+            continue
+        for group in groups:
+            metrics = group.get("Metrics", {}).get("UnblendedCost") or {}
+            keys = list(group.get("Keys") or [])
+            agent = _aws_tag_value(keys[0], tag_agent) if tag_agent and keys else "unknown"
+            budget_idx = 1 if tag_agent else 0
+            budget = (
+                _aws_tag_value(keys[budget_idx], tag_budget)
+                if tag_budget and len(keys) > budget_idx else "default"
+            )
+            rows.append({
+                "start": start_at,
+                "end": end_at,
+                "amount": float(metrics.get("Amount", 0) or 0),
+                "currency": metrics.get("Unit", "USD"),
+                "service": "aws",
+                "agent_id": agent,
+                "budget_id": budget,
+                "group_keys": keys,
+            })
+    return rows
+
+
+def from_aws_cost_rows(rows) -> list[SpendEvent]:
+    """AWS Cost Explorer rows -> SpendEvents."""
+    out = []
+    for r in rows:
+        receipt = f"{r.get('start')}:{r.get('end')}:{r.get('service')}:{r.get('agent_id')}:{r.get('budget_id')}"
+        out.append(SpendEvent(
+            event_id="aws:" + hashlib.sha256(receipt.encode()).hexdigest(),
+            event_time=str(r.get("start") or datetime.now(tz=timezone.utc).date().isoformat()),
+            rail="cloud",
+            provider_name="aws",
+            service_name=str(r.get("service") or "aws"),
+            billed_cost=float(r.get("amount", 0) or 0),
+            billing_currency=str(r.get("currency") or "USD"),
+            consumed_quantity=0,
+            pricing_unit="usd",
+            x_agent_id=str(r.get("agent_id") or "unknown"),
+            x_budget_id=str(r.get("budget_id") or "default"),
+            x_receipt_ref=receipt,
+            x_source_event=source_ref("aws", r),
+        ))
+    return out
+
+
+# --- Cloud cost (GCP Billing Export) ---
+def _gcp_label_value(labels, key: str) -> str:
+    if isinstance(labels, dict):
+        return str(labels.get(key) or "")
+    if isinstance(labels, list):
+        for item in labels:
+            if isinstance(item, dict) and item.get("key") == key:
+                return str(item.get("value") or "")
+    return ""
+
+
+def _gcp_nested(row: dict, path: str, default=""):
+    cur = row
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+    return cur if cur is not None else default
+
+
+def load_gcp_billing_export(path: str | os.PathLike) -> list[dict]:
+    """Load GCP billing export rows from JSON, NDJSON, or CSV.
+
+    This expects rows exported from BigQuery's Cloud Billing export. JSON/NDJSON
+    preserve nested project/service/sku/labels fields best; CSV is supported for
+    simple flattened exports.
+    """
+    p = os.fspath(path)
+    if p.lower().endswith(".csv"):
+        with open(p, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    with open(p, encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError(f"{path} must contain a JSON array")
+        return data
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def from_gcp_billing_rows(rows, *, label_agent: str = "agent_id",
+                          label_budget: str = "budget_id") -> list[SpendEvent]:
+    """GCP Cloud Billing export rows -> SpendEvents."""
+    out = []
+    for r in rows:
+        labels = r.get("labels") or r.get("project.labels") or []
+        project = r.get("project") if isinstance(r.get("project"), dict) else {}
+        service = r.get("service") if isinstance(r.get("service"), dict) else {}
+        sku = r.get("sku") if isinstance(r.get("sku"), dict) else {}
+        cost = float(r.get("cost") or 0)
+        currency = str(r.get("currency") or "USD")
+        service_name = (
+            service.get("description") or r.get("service.description") or
+            service.get("id") or r.get("service.id") or "gcp"
+        )
+        sku_name = sku.get("description") or r.get("sku.description") or ""
+        project_id = project.get("id") or r.get("project.id") or r.get("project_id") or "unknown-project"
+        start = (
+            r.get("usage_start_time") or r.get("usage_start") or
+            r.get("usage_start_time.value") or datetime.now(tz=timezone.utc).isoformat()
+        )
+        agent = _gcp_label_value(labels, label_agent) or r.get(label_agent) or "unknown"
+        budget = _gcp_label_value(labels, label_budget) or r.get(label_budget) or "default"
+        receipt = f"{start}:{project_id}:{service_name}:{sku_name}:{agent}:{budget}:{cost}"
+        out.append(SpendEvent(
+            event_id="gcp:" + hashlib.sha256(receipt.encode()).hexdigest(),
+            event_time=str(start),
+            rail="cloud",
+            provider_name="gcp",
+            service_name=str(service_name),
+            billed_cost=cost,
+            billing_currency=currency,
+            consumed_quantity=float(_gcp_nested(r, "usage.amount", r.get("usage.amount", 0)) or 0),
+            pricing_unit=str(_gcp_nested(r, "usage.unit", r.get("usage.unit", "usage")) or "usage"),
+            x_agent_id=str(agent),
+            x_budget_id=str(budget),
+            x_merchant_id=str(project_id),
+            x_receipt_ref=receipt,
+            x_source_event=source_ref("gcp", r),
+        ))
+    return out
 
 
 # --- Stripe card / PaymentIntent rail (read-only Events API) ---
