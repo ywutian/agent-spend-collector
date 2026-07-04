@@ -32,8 +32,9 @@ from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
     _aws_sigv4_headers, _env_int, _request_json, decode_transfer_log,
-    fetch_aws_cost_and_usage, fetch_openai_costs, fetch_openrouter_generations,
-    from_aws_cost_rows, from_gcp_billing_rows, from_llm_cost_rows,
+    fetch_aws_cost_and_usage, fetch_azure_access_token, fetch_azure_cost_usage,
+    fetch_openai_costs, fetch_openrouter_generations, from_aws_cost_rows,
+    from_azure_cost_rows, from_gcp_billing_rows, from_llm_cost_rows,
     from_openrouter_generation_rows, load_gcp_billing_export,
 )
 from spend_collector.store import SpendStore
@@ -1064,6 +1065,81 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(row["rail"], "cloud")
         self.assertEqual(row["provider_name"], "gcp")
         self.assertAlmostEqual(row["spend"], 4.65)
+
+    def test_fetch_azure_access_token_uses_service_principal_form(self) -> None:
+        import spend_collector.sources as sources
+        seen = {}
+        original = sources._request_json
+
+        def fake_request(req):
+            seen["url"] = req.full_url
+            seen["body"] = req.data.decode()
+            seen["content_type"] = req.headers["Content-type"]
+            return {"access_token": "azure-token"}
+
+        sources._request_json = fake_request
+        try:
+            token = fetch_azure_access_token("tenant-1", "client-1", "secret-1")
+        finally:
+            sources._request_json = original
+
+        self.assertEqual(token, "azure-token")
+        self.assertIn("/tenant-1/oauth2/v2.0/token", seen["url"])
+        self.assertEqual(seen["content_type"], "application/x-www-form-urlencoded")
+        self.assertIn("scope=https%3A%2F%2Fmanagement.azure.com%2F.default", seen["body"])
+
+    def test_fetch_azure_cost_usage_maps_tag_columns_to_cloud_rows(self) -> None:
+        import spend_collector.sources as sources
+        canned = load_fixture("azure_cost_query.json")
+        seen = {}
+        original = sources._request_json
+
+        def fake_request(req):
+            seen["url"] = req.full_url
+            seen["auth"] = req.headers["Authorization"]
+            seen["body"] = json.loads(req.data.decode())
+            return canned
+
+        sources._request_json = fake_request
+        try:
+            rows = fetch_azure_cost_usage(
+                "azure-token",
+                "/subscriptions/sub-1",
+                days=1,
+                tag_agent="agent_id",
+                tag_budget="budget_id",
+            )
+        finally:
+            sources._request_json = original
+
+        self.assertIn("/subscriptions/sub-1/providers/Microsoft.CostManagement/query", seen["url"])
+        self.assertEqual(seen["auth"], "Bearer azure-token")
+        self.assertEqual(seen["body"]["dataset"]["grouping"][0]["type"], "TagKey")
+        self.assertEqual(rows[0]["agent_id"], "research-bot")
+        self.assertEqual(rows[0]["budget_id"], "team-research")
+        self.assertEqual(rows[0]["start"], "2026-06-29")
+        self.assertEqual(rows[0]["amount"], 2.34)
+
+    def test_from_azure_cost_rows_maps_to_cloud_events(self) -> None:
+        rows = [{
+            "start": "2026-06-29",
+            "end": "2026-06-29",
+            "amount": 2.34,
+            "currency": "USD",
+            "service": "azure",
+            "agent_id": "research-bot",
+            "budget_id": "team-research",
+            "scope": "/subscriptions/sub-1",
+        }]
+        events = from_azure_cost_rows(rows)
+
+        self.assertEqual(events[0].rail, "cloud")
+        self.assertEqual(events[0].provider_name, "azure")
+        self.assertEqual(events[0].service_name, "azure")
+        self.assertEqual(events[0].billed_cost, 2.34)
+        self.assertEqual(events[0].x_agent_id, "research-bot")
+        self.assertEqual(events[0].x_budget_id, "team-research")
+        self.assertEqual(events[0].x_merchant_id, "/subscriptions/sub-1")
 
     def test_price_longest_prefix_match(self) -> None:
         self.assertAlmostEqual(_price("gpt-4o", 1_000_000, 0), 2.5)              # exact

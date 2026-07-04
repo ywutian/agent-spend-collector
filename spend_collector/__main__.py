@@ -405,6 +405,50 @@ def pull_gcp_billing_file(db_path: str | Path = "spend.db", out_dir: str | Path 
         _finish_run(store, _load_budgets(), out_dir)
 
 
+def _azure_token_from_env_or_sp(env: dict | None = None) -> str | None:
+    from .sources import fetch_azure_access_token
+    env = env or os.environ
+    token = env.get("AZURE_ACCESS_TOKEN")
+    if token:
+        return token
+    tenant_id = env.get("AZURE_TENANT_ID")
+    client_id = env.get("AZURE_CLIENT_ID")
+    client_secret = env.get("AZURE_CLIENT_SECRET")
+    if tenant_id and client_id and client_secret:
+        return fetch_azure_access_token(tenant_id, client_id, client_secret)
+    return None
+
+
+def pull_azure(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
+               scope: str | None = None, tag_agent: str = "agent_id",
+               tag_budget: str = "budget_id") -> None:
+    """Pull Azure Cost Management spend grouped by agent/budget tags."""
+    from .sources import fetch_azure_cost_usage, from_azure_cost_rows
+    scope = scope or os.environ.get("AZURE_COST_SCOPE")
+    if not scope:
+        print("Set an Azure Cost Management scope:\n"
+              "  export AZURE_COST_SCOPE=/subscriptions/00000000-0000-0000-0000-000000000000\n"
+              "  python3 -m spend_collector pull-azure --scope \"$AZURE_COST_SCOPE\"")
+        sys.exit(1)
+    token = _azure_token_from_env_or_sp()
+    if not token:
+        print("Set Azure read-only Cost Management credentials:\n"
+              "  export AZURE_ACCESS_TOKEN=$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)\n"
+              "  # or set AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET for service principal auth\n"
+              "  python3 -m spend_collector pull-azure --scope \"$AZURE_COST_SCOPE\"")
+        sys.exit(1)
+    with SpendStore(str(db_path)) as store:
+        n = store.ingest(from_azure_cost_rows(fetch_azure_cost_usage(
+            token,
+            scope,
+            days=days,
+            tag_agent=tag_agent,
+            tag_budget=tag_budget,
+        )))
+        print(f"ingested {n} Azure cost rows -> {db_path}")
+        _finish_run(store, _load_budgets(), out_dir)
+
+
 def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
               pay_to: str | None = None, lookback_blocks: int = 2000,
               wallet_map_path: str | Path | None = None) -> None:
@@ -472,10 +516,11 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
     from .sources import (
         env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token,
         env_pay_to, env_usdc_pay_to, fetch_anthropic_cost_report,
-        fetch_aws_cost_and_usage,
+        fetch_aws_cost_and_usage, fetch_azure_access_token, fetch_azure_cost_usage,
         fetch_base_usdc_transfers, fetch_openai_costs, fetch_openrouter_generations,
-        fetch_stripe_payment_intent_events, from_aws_cost_rows, from_gcp_billing_rows,
-        from_llm_cost_rows, from_openrouter_generation_rows, load_gcp_billing_export,
+        fetch_stripe_payment_intent_events, from_aws_cost_rows, from_azure_cost_rows,
+        from_gcp_billing_rows, from_llm_cost_rows, from_openrouter_generation_rows,
+        load_gcp_billing_export,
     )
     config = _load_config(config_path)
     config_base = Path(config_path).resolve().parent if config_path else None
@@ -562,6 +607,30 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
                 print(f"ingested {n} GCP billing rows -> {db_path}")
             else:
                 print("skipped gcp: set rails.gcp.billing_export_file")
+
+        azure_cfg = _rail_config(config, "azure")
+        if _enabled(azure_cfg, default=False):
+            scope = azure_cfg.get("scope") or os.environ.get("AZURE_COST_SCOPE")
+            token = os.environ.get(str(azure_cfg.get("access_token_env", "AZURE_ACCESS_TOKEN")))
+            if not token:
+                tenant_id = os.environ.get(str(azure_cfg.get("tenant_id_env", "AZURE_TENANT_ID")))
+                client_id = os.environ.get(str(azure_cfg.get("client_id_env", "AZURE_CLIENT_ID")))
+                client_secret = os.environ.get(str(azure_cfg.get("client_secret_env", "AZURE_CLIENT_SECRET")))
+                if tenant_id and client_id and client_secret:
+                    token = fetch_azure_access_token(tenant_id, client_id, client_secret)
+            if scope and token:
+                n = store.ingest(from_azure_cost_rows(fetch_azure_cost_usage(
+                    token,
+                    str(scope),
+                    days=int(azure_cfg.get("days", config.get("days", 7))),
+                    tag_agent=str(azure_cfg.get("tag_agent", "agent_id")),
+                    tag_budget=str(azure_cfg.get("tag_budget", "budget_id")),
+                )))
+                print(f"ingested {n} Azure cost rows -> {db_path}")
+            elif not scope:
+                print("skipped azure: set rails.azure.scope or AZURE_COST_SCOPE")
+            else:
+                print("skipped azure: set AZURE_ACCESS_TOKEN or service principal env vars")
 
         x402_cfg = _rail_config(config, "x402")
         if _enabled(x402_cfg):
@@ -1050,6 +1119,14 @@ def _parser() -> argparse.ArgumentParser:
     gcp_p.add_argument("--label-agent", default="agent_id", help="GCP label for agent id")
     gcp_p.add_argument("--label-budget", default="budget_id", help="GCP label for budget id")
 
+    azure_p = sub.add_parser("pull-azure", parents=[common],
+                             help="pull Azure Cost Management spend grouped by tags")
+    azure_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
+    azure_p.add_argument("--days", type=int, default=7, help="days of Azure cost history to request")
+    azure_p.add_argument("--scope", help="Azure Cost Management scope; defaults to AZURE_COST_SCOPE")
+    azure_p.add_argument("--tag-agent", default="agent_id", help="Azure tag for agent id")
+    azure_p.add_argument("--tag-budget", default="budget_id", help="Azure tag for budget id")
+
     all_p = sub.add_parser("pull-all", parents=[common],
                            help="pull every configured rail from one JSON config")
     all_p.add_argument("--config", default="spend.config.json",
@@ -1131,6 +1208,8 @@ def main(argv: list[str] | None = None) -> None:
         pull_gcp_billing_file(
             args.db, args.out_dir, args.billing_export_file, args.label_agent, args.label_budget,
         )
+    elif cmd == "pull-azure":
+        pull_azure(args.db, args.out_dir, args.days, args.scope, args.tag_agent, args.tag_budget)
     elif cmd == "pull-all":
         pull_all(args.config, args.db, args.out_dir)
     elif cmd == "pull-x402":

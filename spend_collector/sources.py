@@ -482,6 +482,169 @@ def from_gcp_billing_rows(rows, *, label_agent: str = "agent_id",
     return out
 
 
+# --- Cloud cost (Azure Cost Management) ---
+_AZURE_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+_AZURE_MANAGEMENT = "https://management.azure.com"
+_AZURE_COST_API_VERSION = "2025-03-01"
+
+
+def env_azure_access_token() -> str | None:
+    return os.environ.get("AZURE_ACCESS_TOKEN")
+
+
+def env_azure_tenant_id() -> str | None:
+    return os.environ.get("AZURE_TENANT_ID")
+
+
+def env_azure_client_id() -> str | None:
+    return os.environ.get("AZURE_CLIENT_ID")
+
+
+def env_azure_client_secret() -> str | None:
+    return os.environ.get("AZURE_CLIENT_SECRET")
+
+
+def fetch_azure_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Fetch an Azure Resource Manager token using service principal credentials."""
+    body = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": f"{_AZURE_MANAGEMENT}/.default",
+        "grant_type": "client_credentials",
+    }).encode()
+    req = urllib.request.Request(
+        _AZURE_TOKEN_URL.format(tenant_id=urllib.parse.quote(tenant_id, safe="")),
+        data=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    data = _request_json(req)
+    token = data.get("access_token") if isinstance(data, dict) else None
+    if not token:
+        raise RuntimeError("Azure token response did not include access_token")
+    return str(token)
+
+
+def _azure_usage_date(value) -> str:
+    text = str(value or "")
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text or datetime.now(tz=timezone.utc).date().isoformat()
+
+
+def _azure_column_value(row: dict, names: list[str], default=None):
+    lowered = {str(k).lower(): v for k, v in row.items()}
+    for name in names:
+        if name in row:
+            return row[name]
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return default
+
+
+def fetch_azure_cost_usage(
+    access_token: str,
+    scope: str,
+    *,
+    days: int = 7,
+    tag_agent: str = "agent_id",
+    tag_budget: str = "budget_id",
+    api_version: str = _AZURE_COST_API_VERSION,
+) -> list[dict]:
+    """Pull Azure Cost Management usage grouped by agent/budget tags."""
+    end = date.today()
+    start = end - timedelta(days=days)
+    grouping = []
+    if tag_agent:
+        grouping.append({"type": "TagKey", "name": tag_agent})
+    if tag_budget:
+        grouping.append({"type": "TagKey", "name": tag_budget})
+    if not grouping:
+        grouping.append({"type": "Dimension", "name": "ResourceGroup"})
+    payload = {
+        "type": "Usage",
+        "timeframe": "Custom",
+        "timePeriod": {
+            "from": f"{start.isoformat()}T00:00:00Z",
+            "to": f"{end.isoformat()}T00:00:00Z",
+        },
+        "dataset": {
+            "granularity": "Daily",
+            "aggregation": {"totalCost": {"name": "PreTaxCost", "function": "Sum"}},
+            "grouping": grouping[:2],
+        },
+    }
+    scope_path = "/" + str(scope).strip("/")
+    url = (
+        f"{_AZURE_MANAGEMENT}{scope_path}/providers/Microsoft.CostManagement/query"
+        f"?api-version={urllib.parse.quote(api_version)}"
+    )
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "authorization": f"Bearer {access_token}",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    data = _request_json(req)
+    props = data.get("properties", data) if isinstance(data, dict) else {}
+    columns = [str(c.get("name", "")) for c in props.get("columns", []) if isinstance(c, dict)]
+    rows: list[dict] = []
+    for values in props.get("rows", []) or []:
+        item = dict(zip(columns, values))
+        amount = _azure_column_value(item, ["PreTaxCost", "Cost", "totalCost"], 0)
+        start_at = _azure_usage_date(_azure_column_value(item, ["UsageDate", "Date"], start.isoformat()))
+        agent = _azure_column_value(item, [tag_agent, f"Tag_{tag_agent}"], "unknown") if tag_agent else "unknown"
+        budget = _azure_column_value(item, [tag_budget, f"Tag_{tag_budget}"], "default") if tag_budget else "default"
+        service = _azure_column_value(
+            item,
+            ["ServiceName", "ResourceType", "ResourceGroup", "MeterCategory"],
+            "azure",
+        )
+        rows.append({
+            "start": start_at,
+            "end": start_at,
+            "amount": float(amount or 0),
+            "currency": str(_azure_column_value(item, ["Currency", "BillingCurrency"], "USD") or "USD"),
+            "service": str(service or "azure"),
+            "agent_id": str(agent or "unknown"),
+            "budget_id": str(budget or "default"),
+            "scope": str(scope),
+            "raw": item,
+        })
+    return rows
+
+
+def from_azure_cost_rows(rows) -> list[SpendEvent]:
+    """Azure Cost Management rows -> SpendEvents."""
+    out = []
+    for r in rows:
+        receipt = (
+            f"{r.get('start')}:{r.get('end')}:{r.get('scope')}:{r.get('service')}:"
+            f"{r.get('agent_id')}:{r.get('budget_id')}:{r.get('amount')}"
+        )
+        out.append(SpendEvent(
+            event_id="azure:" + hashlib.sha256(receipt.encode()).hexdigest(),
+            event_time=str(r.get("start") or datetime.now(tz=timezone.utc).date().isoformat()),
+            rail="cloud",
+            provider_name="azure",
+            service_name=str(r.get("service") or "azure"),
+            billed_cost=float(r.get("amount", 0) or 0),
+            billing_currency=str(r.get("currency") or "USD"),
+            consumed_quantity=0,
+            pricing_unit="usd",
+            x_agent_id=str(r.get("agent_id") or "unknown"),
+            x_budget_id=str(r.get("budget_id") or "default"),
+            x_merchant_id=str(r.get("scope") or "azure"),
+            x_receipt_ref=receipt,
+            x_source_event=source_ref("azure", r),
+        ))
+    return out
+
+
 # --- Stripe card / PaymentIntent rail (read-only Events API) ---
 _STRIPE_EVENTS_URL = "https://api.stripe.com/v1/events"
 

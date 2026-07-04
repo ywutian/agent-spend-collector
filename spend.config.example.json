@@ -50,6 +50,17 @@
       "label_agent": "agent_id",
       "label_budget": "budget_id"
     },
+    "azure": {
+      "enabled": false,
+      "days": 7,
+      "scope": "/subscriptions/00000000-0000-0000-0000-000000000000",
+      "access_token_env": "AZURE_ACCESS_TOKEN",
+      "tenant_id_env": "AZURE_TENANT_ID",
+      "client_id_env": "AZURE_CLIENT_ID",
+      "client_secret_env": "AZURE_CLIENT_SECRET",
+      "tag_agent": "agent_id",
+      "tag_budget": "budget_id"
+    },
     "x402": {
       "enabled": true,
       "pay_to": "0xYourX402ReceivingAddress"

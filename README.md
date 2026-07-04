@@ -3,7 +3,7 @@
 **See and govern every dollar your AI agents spend, across every rail.**
 
 A free, read-only, cross-rail **agent spend collector**. It pulls what your agents
-spend (LLM token cost + x402 payments + direct USDC transfers + AWS/GCP cloud cost + Stripe card payments),
+spend (LLM token cost + x402 payments + direct USDC transfers + AWS/GCP/Azure cloud cost + Stripe card payments),
 normalizes it into **one [FOCUS](https://focus.finops.org/)-shaped ledger**, and
 flags anomalies: runaway loops, cost spikes, budget burn. **It never touches your
 money** (read-only), so it clears security review on day one.
@@ -269,6 +269,16 @@ python3 -m spend_collector pull-gcp-billing-file \
   --db spend.db \
   --out-dir artifacts
 
+# Azure cloud cost: Cost Management grouped by tags
+export AZURE_COST_SCOPE=/subscriptions/00000000-0000-0000-0000-000000000000
+export AZURE_ACCESS_TOKEN="$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)"
+python3 -m spend_collector pull-azure \
+  --scope "$AZURE_COST_SCOPE" \
+  --tag-agent agent_id \
+  --tag-budget budget_id \
+  --db spend.db \
+  --out-dir artifacts
+
 # x402 payments: USDC settlements into your merchant address on Base
 python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
 
@@ -312,6 +322,7 @@ Attribution:
 - OpenRouter: gateway headers (`X-Agent-ID`, `X-Budget-ID`) for live calls; generation metadata `external_user` for post-hoc pulls.
 - AWS: Cost Allocation Tags, default `agent_id` and `budget_id`.
 - GCP: Cloud Billing export labels, default `agent_id` and `budget_id`.
+- Azure: Cost Management tags, default `agent_id` and `budget_id`; use a Cost Management Reader-capable identity.
 - x402: payer wallet.
 - USDC: payer wallet by default; map wallet addresses to agents/budgets upstream.
 - Stripe: `PaymentIntent.metadata.agent_id` and `metadata.budget_id`.
@@ -367,7 +378,7 @@ book covers common models and everything else prices at zero until added.
 | `store.py` | Append-only, idempotent SQLite ledger + summaries |
 | `adapters.py` | Normalizers: token usage / cloud cost / x402 settlements / USDC transfers / Stripe events -> ledger rows |
 | `providers.py` | Curated provider catalog (LLM + tool APIs + payment rails) + usage-shape resolver |
-| `sources.py` | Live read-only pulls: Anthropic/OpenAI cost APIs, OpenRouter generation metadata, AWS Cost Explorer, GCP Billing Export files, Base USDC logs, Stripe Events API |
+| `sources.py` | Live read-only pulls: Anthropic/OpenAI cost APIs, OpenRouter generation metadata, AWS Cost Explorer, GCP Billing Export files, Azure Cost Management, Base USDC logs, Stripe Events API |
 | `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants, off-hours activity |
 | `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
 | `report.py` | Zero-dependency static HTML dashboard |
@@ -393,10 +404,11 @@ detect -> inline -> on-chain
 4. Done: direct USDC stablecoin rail on Base (`pull-usdc`).
 5. Done: AWS cloud cost rail via Cost Explorer (`pull-aws`).
 6. Done: GCP cloud cost rail via Billing Export files (`pull-gcp-billing-file`).
-7. Done: Stripe Events rail, token + crypto + cloud + card in one ledger (`pull-stripe`).
-8. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-9. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
-10. Next: Azure cloud rail, LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
+7. Done: Azure cloud cost rail via Cost Management (`pull-azure`).
+8. Done: Stripe Events rail, token + crypto + cloud + card in one ledger (`pull-stripe`).
+9. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
+10. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
+11. Next: LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
 Requires Python 3.10+. No required dependencies; optional `tokencost`
 (`pip install spend-collector[pricing]`) for accurate pricing across 400+ models,

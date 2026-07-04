@@ -1,0 +1,42 @@
+{
+  "properties": {
+    "columns": [
+      {
+        "name": "PreTaxCost",
+        "type": "Number"
+      },
+      {
+        "name": "agent_id",
+        "type": "TagKey"
+      },
+      {
+        "name": "budget_id",
+        "type": "TagKey"
+      },
+      {
+        "name": "UsageDate",
+        "type": "Number"
+      },
+      {
+        "name": "Currency",
+        "type": "String"
+      }
+    ],
+    "rows": [
+      [
+        2.34,
+        "research-bot",
+        "team-research",
+        20260629,
+        "USD"
+      ],
+      [
+        1.11,
+        "ops-bot",
+        "team-ops",
+        20260629,
+        "USD"
+      ]
+    ]
+  }
+}
