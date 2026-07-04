@@ -227,6 +227,43 @@ def new_merchant_provider(store: SpendStore, *, lookback_hours: int = 24, min_am
     return alerts
 
 
+def off_hours_activity(store: SpendStore, *, lookback_hours: int = 24, min_amount: float = 1.0,
+                       baseline_events: int = 5) -> list[Alert]:
+    """Flag an agent spending in an hour-of-day it has never been active in before
+    (after an established baseline) -- e.g. a 9-to-5 agent that suddenly spends at 3am,
+    the classic hijacked-key signature. Timezone-agnostic: relative to the agent's own
+    history, not a fixed night window.
+    """
+    rows = _rows(store)
+    now = _anchor_time(rows)
+    if not now:
+        return []
+    seen_hours: dict[str, set[int]] = {}
+    count: dict[str, int] = {}
+    alerts: list[Alert] = []
+    cutoff = now - timedelta(hours=lookback_hours)
+    for r in rows:
+        agent = r["x_agent_id"]
+        t = _parse_time(r["event_time"])
+        if not t:
+            continue
+        new_hour = t.hour not in seen_hours.get(agent, set())
+        if (
+            count.get(agent, 0) >= baseline_events
+            and new_hour
+            and t >= cutoff
+            and r["billed_cost"] >= min_amount
+        ):
+            alerts.append(Alert(
+                "off_hours_activity", agent,
+                f"first activity at {t.hour:02d}:00 UTC, spend ${r['billed_cost']:.2f}",
+                "warn", r["billed_cost"],
+            ))
+        count[agent] = count.get(agent, 0) + 1
+        seen_hours.setdefault(agent, set()).add(t.hour)
+    return alerts
+
+
 def run_all(store: SpendStore, caps: dict[str, float]) -> list[Alert]:
     return (
         spend_spikes(store)
@@ -235,4 +272,5 @@ def run_all(store: SpendStore, caps: dict[str, float]) -> list[Alert]:
         + spend_per_task(store)
         + new_key_spikes(store)
         + new_merchant_provider(store)
+        + off_hours_activity(store)
     )

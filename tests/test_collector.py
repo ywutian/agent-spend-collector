@@ -12,17 +12,22 @@ import time
 import urllib.error
 import urllib.request
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from spend_collector.__main__ import (
-    _alert_row, _is_event_stream, _load_budgets, _run_summary, _usage_body_from_sse,
-    _with_stream_usage, main, make_gateway_server,
+    _alert_payload, _alert_row, _is_event_stream, _load_budgets, _run_summary,
+    _usage_body_from_sse, _with_stream_usage, main, make_gateway_server,
 )
 from spend_collector.adapters import (
-    _price, from_llm_usage, from_stripe_events, from_usdc_transfers, from_x402_settlements,
+    _price, _tokencost_price, from_llm_usage, from_stripe_events,
+    from_usdc_transfers, from_x402_settlements,
 )
-from spend_collector.detectors import run_all
-from spend_collector.gateway import GuardRequest, decide, record_forwarded_spend
+from spend_collector.detectors import Alert, off_hours_activity, run_all
+from spend_collector.gateway import (
+    GuardRequest, decide, record_forwarded_spend, record_target_spend, validate_policy,
+)
+from spend_collector.providers import KNOWN_PROVIDERS, llm_provider, usage_tokens
 from spend_collector.report import _money, render
 from spend_collector.schema import COLUMNS, SpendEvent
 from spend_collector.sources import (
@@ -1124,6 +1129,112 @@ class CollectorTest(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event.consumed_quantity, 1500)
         self.assertGreater(event.billed_cost, 0)  # claude-opus-4-8 is priced
+
+    def test_gateway_records_gemini_usage_shape(self) -> None:
+        # Gemini native: usageMetadata.promptTokenCount / candidatesTokenCount, modelVersion
+        raw = json.dumps({
+            "modelVersion": "gemini-2.5-flash",
+            "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 500},
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, {"provider": "gemini"},
+                                       {"agent": "advisor-bot", "budget": "team-edu"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertEqual(event.service_name, "gemini-2.5-flash")
+        self.assertGreater(event.billed_cost, 0)
+
+    def test_gateway_records_target_tool_spend(self) -> None:
+        # non-LLM tools have no token usage -> record the flat per-call amount
+        store = SpendStore()
+        self.addCleanup(store.close)
+        guard_payload = {"agent": "research-bot", "budget": "team", "rail": "api",
+                         "provider": "deepgram", "service": "deepgram", "amount": 0.0043}
+        event = record_target_spend(store, guard_payload, "req-tool-1")
+        self.assertIsNotNone(event)
+        self.assertEqual(event.rail, "api")
+        self.assertEqual(event.provider_name, "deepgram")
+        self.assertEqual(event.pricing_unit, "call")
+        self.assertAlmostEqual(event.billed_cost, 0.0043)
+        self.assertAlmostEqual(store.total(), 0.0043)
+        # no amount or no request id -> nothing recorded
+        self.assertIsNone(record_target_spend(store, {"amount": 0}, "req-x"))
+        self.assertIsNone(record_target_spend(store, {"amount": 1.0}, ""))
+
+    def test_off_hours_activity_detector(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        evs = [SpendEvent(f"day-{i}", f"2026-06-29T09:0{i}:00+00:00", "llm_token", "openai",
+                          "gpt-4o", 0.5, "USD", 100, "token", "night-bot", "team") for i in range(6)]
+        evs.append(SpendEvent("night", "2026-06-30T03:30:00+00:00", "llm_token", "openai",
+                              "gpt-4o", 5.0, "USD", 1000, "token", "night-bot", "team"))
+        store.ingest(evs)
+        alerts = off_hours_activity(store)
+        self.assertTrue(any(a.kind == "off_hours_activity" and a.subject == "night-bot" for a in alerts))
+
+    def test_gateway_hourly_rate_cap_denies_burst(self) -> None:
+        store = SpendStore()
+        self.addCleanup(store.close)
+        store.ingest([SpendEvent("r1", datetime.now(timezone.utc).isoformat(), "llm_token",
+                     "openai", "gpt-4o", 4.0, "USD", 100, "token", "bot", "team-x")])
+        policy = {"max_amount_per_hour": {"team-x": 5.0}}
+        allow = decide(store, policy, GuardRequest(x_agent_id="bot", rail="llm_token", amount=0.5, x_budget_id="team-x"))
+        self.assertEqual(allow.decision, "allow")   # 4 + 0.5 <= 5
+        deny = decide(store, policy, GuardRequest(x_agent_id="bot", rail="llm_token", amount=2.0, x_budget_id="team-x"))
+        self.assertEqual(deny.decision, "deny")     # 4 + 2 > 5
+        self.assertTrue(any("hourly rate" in r for r in deny.reasons))
+
+    def test_alert_payload_only_for_high_severity(self) -> None:
+        warns = [Alert("new_merchant_provider", "bot", "new", "warn", 1.0)]
+        highs = [Alert("spend_spike", "bot", "big charge", "high", 9.9)]
+        self.assertIsNone(_alert_payload(warns, {"total_spend": 1}))
+        payload = _alert_payload(highs, {"total_spend": 9.9})
+        self.assertIsNotNone(payload)
+        self.assertIn("spend_spike", payload["text"])
+        self.assertEqual(len(payload["alerts"]), 1)
+
+    def test_provider_catalog_and_usage_shapes(self) -> None:
+        # usage_tokens spans the four LLM response families
+        self.assertEqual(usage_tokens({"usage": {"prompt_tokens": 10, "completion_tokens": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"usage": {"input_tokens": 10, "output_tokens": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}), (10, 5))
+        self.assertEqual(usage_tokens({"meta": {"billed_units": {"input_tokens": 10, "output_tokens": 5}}}), (10, 5))
+        self.assertEqual(usage_tokens({}), (0, 0))
+        # catalog lets a policy name a provider instead of writing base_url/api_key_env
+        self.assertIn("groq", KNOWN_PROVIDERS)
+        self.assertTrue(llm_provider("groq")["base_url"])
+        self.assertIsNone(llm_provider("not-a-provider"))
+        errs = validate_policy({"gateway_tokens": ["t"], "providers": {
+            "mistral": {"service_from_body": "model", "amount": 0.25, "budget": "b"}}})
+        self.assertEqual(errs, [])  # known provider name -> base_url/api_key_env optional
+
+    def test_gateway_records_cohere_usage_shape(self) -> None:
+        # Cohere: meta.billed_units.{input_tokens,output_tokens}; model from the request
+        raw = json.dumps({
+            "id": "c1", "meta": {"billed_units": {"input_tokens": 1000, "output_tokens": 500}},
+        }).encode()
+        store = SpendStore()
+        self.addCleanup(store.close)
+        event = record_forwarded_spend(store, raw, {"provider": "cohere"},
+                                       {"agent": "advisor-bot", "budget": "team-edu", "service": "command-r-plus"})
+        self.assertIsNotNone(event)
+        self.assertEqual(event.consumed_quantity, 1500)
+        self.assertEqual(event.service_name, "command-r-plus")
+        self.assertGreater(event.billed_cost, 0)
+
+    def test_tokencost_optional_pricing_fallback(self) -> None:
+        try:
+            import tokencost  # noqa: F401
+            has_tc = True
+        except ImportError:
+            has_tc = False
+        if not has_tc:  # no dependency -> None, and _price still works via static book
+            self.assertIsNone(_tokencost_price("gpt-4o-mini", 1000, 500))
+        # tokencost and the static book agree here, so this is deterministic either way
+        self.assertAlmostEqual(_price("gpt-4o-mini", 1000, 500), 0.00045)
+        self.assertGreater(_price("gemini-2.5-flash", 1000, 500), 0)  # added to fallback
+        self.assertEqual(_price("totally-unknown-xyz", 1000, 500), 0.0)  # never crashes
 
     def test_gateway_records_streamed_spend(self) -> None:
         # stream:true -> gateway asks the provider for a final usage chunk

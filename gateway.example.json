@@ -45,6 +45,16 @@
       "service_from_body": "model",
       "amount": 0.25,
       "budget": "team-research"
+    },
+    "groq": {
+      "base_url": "https://api.groq.com/openai",
+      "api_key_env": "GROQ_API_KEY",
+      "rail": "llm_token",
+      "provider": "groq",
+      "merchant": "groq",
+      "service_from_body": "model",
+      "amount": 0.25,
+      "budget": "team-research"
     }
   },
   "targets": {

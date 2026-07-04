@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 from .adapters import _price
+from .providers import llm_provider, usage_tokens
 from .schema import SpendEvent, source_ref
 from .store import SpendStore
 
@@ -74,6 +75,26 @@ def _spent_for_budget(store: SpendStore, budget: str) -> float:
         (budget,),
     ).fetchone()
     return float(row["spent"] or 0)
+
+
+def _spent_since(store: SpendStore, budget: str, since_iso: str) -> float:
+    # ponytail: string compare of same-format ISO timestamps = chronological; gateway
+    # events all use datetime.now(utc).isoformat(), so this is correct for live spend.
+    row = store.db.execute(
+        "SELECT COALESCE(SUM(billed_cost), 0) AS spent FROM spend_events "
+        "WHERE x_budget_id = ? AND event_time > ?",
+        (budget, since_iso),
+    ).fetchone()
+    return float(row["spent"] or 0)
+
+
+def _hourly_cap(policy: dict, budget: str) -> float | None:
+    limits = policy.get("max_amount_per_hour")
+    if isinstance(limits, dict):
+        cap = limits.get(budget)
+    else:
+        cap = limits  # a bare number applies to every budget
+    return float(cap) if cap is not None else None
 
 
 def _budget_cap(policy: dict, agent: str, budget: str) -> float | None:
@@ -140,6 +161,15 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
         else:
             reasons.append(f"budget {req.x_budget_id} remaining {float(cap) - spent - reserved - req.amount:.2f}")
 
+    rate_cap = _hourly_cap(policy, req.x_budget_id)  # velocity: catch runaway loops fast
+    if rate_cap is not None:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        recent = _spent_since(store, req.x_budget_id, since)
+        if recent + req.amount > rate_cap:
+            deny.append(f"budget {req.x_budget_id} hourly rate {recent + req.amount:.2f}/{rate_cap:.2f} exceeded")
+        else:
+            reasons.append(f"budget {req.x_budget_id} hourly {recent + req.amount:.2f}/{rate_cap:.2f}")
+
     merchant_key = req.merchant_key()
     allowed_merchants = set(_list(agent.get("merchants")) or _list(policy.get("merchants")))
     if allowed_merchants and merchant_key not in allowed_merchants:
@@ -160,8 +190,8 @@ def validate_policy(policy: dict) -> list[str]:
     errors: list[str] = []
     root_keys = {
         "agents_allowed", "rails", "budgets", "max_amount", "max_amount_by_rail",
-        "warn_new_merchants", "deny_new_merchants", "agents", "merchants",
-        "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
+        "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
+        "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
     }
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
     target_keys = {
@@ -227,10 +257,11 @@ def validate_policy(policy: dict) -> list[str]:
         for key in provider:
             if key not in provider_keys:
                 errors.append(f"unknown provider key for {name}: {key}")
-        if "base_url" not in provider:
-            errors.append(f"provider {name} missing base_url")
-        if "api_key_env" not in provider:
-            errors.append(f"provider {name} missing api_key_env")
+        known = llm_provider(name)  # base_url/api_key_env optional for a known provider name
+        if "base_url" not in provider and not (known and known.get("base_url")):
+            errors.append(f"provider {name} missing base_url (or use a known provider name)")
+        if "api_key_env" not in provider and not (known and known.get("api_key_env")):
+            errors.append(f"provider {name} missing api_key_env (or use a known provider name)")
         if "amount" not in provider and "max_estimated_amount" not in provider:
             errors.append(f"provider {name} missing amount or max_estimated_amount")
 
@@ -287,14 +318,12 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         data = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    usage = (data.get("usage") if isinstance(data, dict) else None) or {}
-    if not usage:
+    prompt, completion = usage_tokens(data)  # OpenAI / Anthropic / Gemini / Cohere shapes
+    if not prompt and not completion:
         return None
     pname = str(provider.get("provider", "openai"))
-    model = str(data.get("model") or guard_payload.get("service") or pname)
-    # OpenAI: prompt_tokens/completion_tokens. Anthropic: input_tokens/output_tokens.
-    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-    completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    model = str(data.get("model") or data.get("modelVersion") or guard_payload.get("service") or pname)
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     total = int(usage.get("total_tokens", prompt + completion) or prompt + completion)
     billed_cost = (
         float(usage["cost"])
@@ -317,7 +346,41 @@ def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_
         x_session_id=str(guard_payload.get("session", "")),
         x_merchant_id=pname,
         x_receipt_ref=str(data.get("id", "")),
-        x_source_event=source_ref(pname, {"id": data.get("id"), "model": model, "usage": usage}),
+        x_source_event=source_ref(pname, {"id": data.get("id"), "model": model, "tokens": [prompt, completion]}),
     )
     store.ingest([event])
+    return event
+
+
+def record_target_spend(store: SpendStore, guard_payload: dict, request_id: str):
+    """Record a forwarded non-LLM tool/API call. These meter differently per vendor
+    (audio seconds, characters, pages, per-call), so there is no universal usage to
+    parse -- we record the policy's flat per-call `amount` and release the hold.
+    For exact metered cost, add a per-tool extractor or reconcile from billing.
+    """
+    amount = float(guard_payload.get("amount", 0) or 0)
+    if amount <= 0 or not request_id:
+        return None
+    provider = str(guard_payload.get("provider", "tool"))
+    service = str(guard_payload.get("service") or guard_payload.get("merchant") or "tool")
+    event = SpendEvent(
+        event_id=f"gw:target:{request_id}",
+        event_time=datetime.now(tz=timezone.utc).isoformat(),
+        rail=str(guard_payload.get("rail", "api")),
+        provider_name=provider,
+        service_name=service,
+        billed_cost=amount,
+        billing_currency="USD",
+        consumed_quantity=1,
+        pricing_unit="call",
+        x_agent_id=str(guard_payload.get("agent", "unknown")),
+        x_budget_id=str(guard_payload.get("budget", "default")),
+        x_session_id=str(guard_payload.get("session", "")),
+        x_merchant_id=str(guard_payload.get("merchant", "")),
+        x_receipt_ref=request_id,
+        x_source_event=source_ref(provider, {"target": service, "amount": amount, "request_id": request_id}),
+        charge_category="Purchase",
+    )
+    store.ingest([event])
+    store.release_reservation(request_id)
     return event

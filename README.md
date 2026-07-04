@@ -202,7 +202,7 @@ block the spend when the decision is `deny`.
 
 ## Verify locally
 
-The project is stdlib-only. Run the test suite and product demo with:
+The project needs no required dependencies. Run the test suite and product demo with:
 
 ```bash
 python3 -m unittest discover -s tests
@@ -319,6 +319,46 @@ Attribution:
 OpenAI can follow the Anthropic cost-report shape. OpenRouter is easiest through
 the gateway because responses include usage and cost metadata.
 
+## Providers and pricing
+
+Agent spend is more than LLM tokens. `spend_collector/providers.py` is a curated
+catalog across three categories (base URLs / unit costs are defaults — verify and
+override per your account):
+
+- **LLM** (forward + record token usage): `openai`, `anthropic`, `gemini`,
+  `cohere`, `groq`, `together`, `fireworks`, `deepinfra`, `deepseek`, `xai`,
+  `mistral`, `perplexity`, `openrouter`, `moonshot`, `dashscope`, `zhipu`,
+  `ollama`, `vllm`.
+- **Paid tools / data APIs** (forward via a `target`, per-call cost): `tavily`,
+  `serper`, `exa`, `brave`, `firecrawl`, `scrapingbee`, `apify`, `elevenlabs`,
+  `deepgram`, `replicate`, `fal`, `e2b`.
+- **Payment rails** (captured by ingestion): `stripe`, `x402` (+ `skyfire`,
+  `coinbase`).
+
+Tool spend is recorded in real time as the target's flat per-call `amount` — enough
+for budget caps and call-volume anomalies. Tools meter differently (audio seconds,
+characters, pages), so treat that as an estimate; the authoritative cost is the
+provider's billed charge, captured separately by `pull-stripe`. They are two views
+of the same spend (real-time estimate on the `api` rail vs. billed truth on the
+`card` rail) — reconcile by comparing them, not by summing; the delta is a signal.
+
+**Naming a known LLM provider is enough** — the gateway fills its base URL and key
+env from the catalog, so a policy entry can be just a budget and cap. Route at
+`/<provider>/...`:
+
+```json
+"providers": { "mistral": {"service_from_body": "model", "amount": 0.25, "budget": "team"} }
+```
+
+Override `base_url`/`api_key_env` for anything custom (self-hosted, Azure, a
+region). Recording auto-detects token usage across **OpenAI**
+(`prompt_tokens`/`completion_tokens`), **Anthropic** (`input_tokens`/
+`output_tokens`), **Gemini** (`usageMetadata`), and **Cohere** (`meta.billed_units`).
+
+**Pricing:** install `tokencost` (`pip install spend-collector[pricing]`) for
+accurate, maintained rates across 400+ models. Without it, a small built-in price
+book covers common models and everything else prices at zero until added.
+
 ## What's inside
 
 | File | Role |
@@ -326,8 +366,9 @@ the gateway because responses include usage and cost metadata.
 | `schema.py` | FOCUS-shaped `SpendEvent` (one row shape for every rail) |
 | `store.py` | Append-only, idempotent SQLite ledger + summaries |
 | `adapters.py` | Normalizers: token usage / cloud cost / x402 settlements / USDC transfers / Stripe events -> ledger rows |
+| `providers.py` | Curated provider catalog (LLM + tool APIs + payment rails) + usage-shape resolver |
 | `sources.py` | Live read-only pulls: Anthropic/OpenAI cost APIs, OpenRouter generation metadata, AWS Cost Explorer, GCP Billing Export files, Base USDC logs, Stripe Events API |
-| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants |
+| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants, off-hours activity |
 | `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
 | `report.py` | Zero-dependency static HTML dashboard |
 
@@ -357,4 +398,6 @@ detect -> inline -> on-chain
 9. In progress: inline pre-spend gateway (`guard` / local HTTP `/guard`).
 10. Next: Azure cloud rail, LLM proxy / x402 middleware around the gateway; Grafana/Metabase on the DB.
 
-Requires Python 3.10+. No dependencies. License: MIT.
+Requires Python 3.10+. No required dependencies; optional `tokencost`
+(`pip install spend-collector[pricing]`) for accurate pricing across 400+ models,
+otherwise a small built-in price book. License: MIT.
