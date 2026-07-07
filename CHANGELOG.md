@@ -19,8 +19,15 @@ self-hosted pre-spend gateway.
 ### Gateway
 - Pre-spend allow/deny from policy + ledger history; forwards, records actual
   spend, and releases the reservation — for LLM and non-LLM tool calls.
-- Budget caps, per-rail / per-amount limits, new-merchant rules, and an hourly
-  **velocity cap** (`max_amount_per_hour`).
+- Budget caps, per-rail / per-amount limits, new-merchant rules, and a race-safe
+  hourly **velocity cap** (`max_amount_per_hour`).
+- **Kill-switch** (`freeze` / `unfreeze`) and **behavioral blocking**
+  (`block_on_anomaly`): deny a call while its agent is frozen or currently flagged
+  by a detector.
+- **Content guard** (`content_guard`): reject oversized payloads, deny patterns,
+  and outbound secrets before spending — a deterministic Layer-1 signal.
+- **x402 seller-side middleware**: serve `/x402/<resource-id>`, answer with HTTP
+  402 + payment requirements, verify/settle via a facilitator, then forward.
 - Live token-gated `/dashboard` that auto-refreshes.
 
 ### Detection & alerting
