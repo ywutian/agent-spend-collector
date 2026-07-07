@@ -15,6 +15,16 @@
 
 Collection is read-only. It does not move your money, and provider keys, wallet keys, prompts, request bodies, and completions should stay outside the ledger and dashboard.
 
+### Which path should I take?
+
+| I want to... | Command |
+|---|---|
+| Just see what it does | `spend-collector demo` |
+| Track my real spend | `spend-collector init` → `spend-collector pull-all` |
+| Block spend before it happens | `spend-collector gateway` |
+
+> On macOS/Linux use `python3 -m spend_collector ...`; on Windows use `python -m spend_collector ...`. After `pip install .` the `spend-collector` command shown above works everywhere.
+
 ### Quick Start
 
 Run the full demo with no dependencies and no real keys:
@@ -23,7 +33,7 @@ Run the full demo with no dependencies and no real keys:
 python3 -m spend_collector demo
 ```
 
-Then open `report.html`.
+It builds the ledger, runs the detectors, and opens `report.html` in your browser automatically. Add `--no-open` to skip that (handy in CI).
 
 The demo path is:
 
@@ -92,10 +102,13 @@ The demo fixtures intentionally trigger several alerts so you can see the produc
 
 Use one config file for normal runs. Enable only the rails you use, keep secrets in environment variables, then run `pull-all`.
 
+Run `init` to scaffold the config and check the environment variables it needs:
+
 ```bash
-cp spend.config.example.json spend.config.json
-# edit spend.config.json once
+python3 -m spend_collector init
 ```
+
+`init` writes `spend.config.json` from the template (it will not overwrite an existing one unless you pass `--force`) and prints an `[ok]` / `[missing]` checklist for every enabled rail, so you know exactly which keys to export before `pull-all`.
 
 Example `spend.config.json`:
 
@@ -342,6 +355,16 @@ What is not included: a hosted enterprise control plane with SSO/RBAC, multi-ten
 
 采集阶段是只读的，不会动你的钱。provider key、钱包私钥、prompt、请求体和模型输出都不应该进入账本或 dashboard。
 
+### 我该走哪条路？
+
+| 我想… | 命令 |
+|---|---|
+| 先看看效果 | `spend-collector demo` |
+| 接入真实花费 | `spend-collector init` → `spend-collector pull-all` |
+| 花钱前拦截 | `spend-collector gateway` |
+
+> macOS/Linux 用 `python3 -m spend_collector ...`，Windows 用 `python -m spend_collector ...`。执行 `pip install .` 后，上表里的 `spend-collector` 命令在所有平台都能直接用。
+
 ### 快速开始
 
 无需依赖、无需真实 key，直接跑完整 demo：
@@ -350,7 +373,7 @@ What is not included: a hosted enterprise control plane with SSO/RBAC, multi-ten
 python3 -m spend_collector demo
 ```
 
-然后打开 `report.html`。
+它会建好账本、跑完检测器，并自动在浏览器里打开 `report.html`。加 `--no-open` 可以跳过自动打开（CI 里更合适）。
 
 demo 会完成这条链路：
 
@@ -419,10 +442,13 @@ demo 数据会故意触发多个告警，方便你一跑就看到效果。
 
 正常使用时建议只走一个配置文件。你只需要启用自己用到的数据来源，把密钥放在环境变量里，然后运行 `pull-all`。
 
+用 `init` 生成配置，并检查它需要的环境变量：
+
 ```bash
-cp spend.config.example.json spend.config.json
-# 只需要编辑一次 spend.config.json
+python3 -m spend_collector init
 ```
+
+`init` 会从模板生成 `spend.config.json`（已存在时不会覆盖，除非加 `--force`），并为每个已启用的 rail 打印 `[ok]` / `[missing]` 清单，让你清楚 `pull-all` 之前还需要 export 哪些 key。
 
 示例 `spend.config.json`：
 

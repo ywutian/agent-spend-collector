@@ -5,6 +5,16 @@ Notable changes to this project. Loosely follows Keep a Changelog; versioning is
 
 ## [Unreleased]
 
+### CLI & onboarding
+- New `init` command scaffolds `spend.config.json` from the template and prints an
+  `[ok]` / `[missing]` checklist of the environment variables each enabled rail
+  needs, so the path from `demo` to real data no longer requires editing JSON blind.
+- `demo` now opens `report.html` in the browser automatically; add `--open` to any
+  other run-producing command, or `--no-open` to `demo` for CI. Self-check lines are
+  hidden behind `--verbose`, and `demo` ends with a "what you got / next steps" block.
+- Added `--version`, a working `help` subcommand, and grouped `--help` output
+  (common commands / single-rail pulls / gateway & safety).
+
 ### Gateway
 - Pre-spend hold for LLM forwards is now the request's **worst-case** cost — the
   model priced at estimated input tokens + the request's `max_tokens` (or a

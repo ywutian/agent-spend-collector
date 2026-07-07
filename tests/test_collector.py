@@ -14,6 +14,7 @@ import urllib.request
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from spend_collector.__main__ import (
     _alert_payload, _alert_platform, _alert_row, _format_alert, _is_event_stream,
@@ -202,7 +203,7 @@ class CollectorTest(unittest.TestCase):
     def test_cli_demo_writes_artifacts_to_out_dir(self) -> None:
         with tempfile.TemporaryDirectory() as out_dir:
             with contextlib.redirect_stdout(io.StringIO()):
-                main(["demo", "--out-dir", out_dir])
+                main(["demo", "--out-dir", out_dir, "--no-open"])
             self.assertTrue((Path(out_dir) / "report.html").exists())
             self.assertTrue((Path(out_dir) / "alerts.json").exists())
             self.assertTrue((Path(out_dir) / "run-summary.json").exists())
@@ -1798,6 +1799,79 @@ class CollectorTest(unittest.TestCase):
                       "gpt-4o", 0.001, "USD", 10, "token", "spiky-bot", "b")])
         old = decide(store, policy, GuardRequest(x_agent_id="spiky-bot", rail="llm_token", amount=0.01, x_budget_id="b"))
         self.assertEqual(old.decision, "allow")
+
+    def test_cli_version_prints_version(self) -> None:
+        from spend_collector import __version__
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn(__version__, stdout.getvalue())
+
+    def test_cli_help_subcommand_prints_grouped_help(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            main(["help"])
+        out = stdout.getvalue()
+        self.assertIn("Common commands:", out)
+        self.assertIn("Single-rail pulls", out)
+
+    def test_cli_init_scaffolds_config_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "spend.config.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main(["init", "--config", str(cfg)])
+            self.assertTrue(cfg.exists())
+            first = stdout.getvalue()
+            self.assertIn("Wrote", first)
+            # placeholder pay_to on the enabled x402/usdc rails is flagged
+            self.assertIn("[missing]", first)
+
+            # second run without --force must not overwrite
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main(["init", "--config", str(cfg)])
+            self.assertIn("already exists", stdout.getvalue())
+
+            # --force rewrites from the example
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main(["init", "--config", str(cfg), "--force"])
+            self.assertIn("Wrote", stdout.getvalue())
+
+    def test_cli_init_checks_env_var_for_enabled_rail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "spend.config.json"
+            cfg.write_text(json.dumps({
+                "rails": {"stripe": {"enabled": True, "api_key_env": "SPEND_TEST_KEY_XYZ"}}
+            }), encoding="utf-8")
+            os.environ.pop("SPEND_TEST_KEY_XYZ", None)
+            self.addCleanup(lambda: os.environ.pop("SPEND_TEST_KEY_XYZ", None))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main(["init", "--config", str(cfg)])
+            self.assertIn("[missing] stripe: SPEND_TEST_KEY_XYZ", stdout.getvalue())
+
+            os.environ["SPEND_TEST_KEY_XYZ"] = "present"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                main(["init", "--config", str(cfg)])
+            self.assertIn("[ok]      stripe: SPEND_TEST_KEY_XYZ set", stdout.getvalue())
+
+    def test_cli_demo_opens_report_by_default_but_not_with_no_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("spend_collector.__main__.webbrowser.open", return_value=True) as opened:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["demo", "--out-dir", tmp])
+                self.assertEqual(opened.call_count, 1)
+
+            with mock.patch("spend_collector.__main__.webbrowser.open", return_value=True) as opened:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["demo", "--out-dir", tmp, "--no-open"])
+                opened.assert_not_called()
 
     def test_freeze_cli_edits_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

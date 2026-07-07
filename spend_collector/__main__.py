@@ -11,7 +11,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 from pathlib import Path
+
+from . import __version__
 
 from .adapters import from_llm_usage, from_stripe_events, from_usdc_transfers, from_x402_settlements
 from .detectors import run_all
@@ -36,6 +39,7 @@ from .store import SpendStore
 
 _ROOT = Path(__file__).resolve().parent.parent
 _FIXTURES = _ROOT / "fixtures"
+_CONFIG_EXAMPLE = _ROOT / "spend.config.example.json"
 
 
 def _load_fixture(name: str):
@@ -412,7 +416,16 @@ def _notify_alerts(alerts: list, summary: dict) -> bool:
         return False
 
 
-def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Path = ".") -> None:
+def _open_in_browser(path: Path) -> bool:
+    """Open a local file in the default browser. Silent no-op on failure/headless."""
+    try:
+        return webbrowser.open(path.resolve().as_uri())
+    except (webbrowser.Error, OSError, ValueError):
+        return False
+
+
+def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Path = ".",
+                open_report: bool = False) -> None:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     _print_summary(store)
@@ -429,7 +442,10 @@ def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Pat
     summary_path = out_path / "run-summary.json"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(render(store, budgets, alerts))
-    print(f"\nWrote {report_path}  (open in a browser)")
+    if open_report and _open_in_browser(report_path):
+        print(f"\nOpened {report_path} in your browser")
+    else:
+        print(f"\nWrote {report_path}  (open in a browser)")
     summary = _run_summary(store, alerts, budgets)
     _write_json_artifact(alerts_path, [_alert_row(a) for a in alerts])
     _write_json_artifact(summary_path, summary)
@@ -438,7 +454,19 @@ def _finish_run(store: SpendStore, budgets: dict[str, float], out_dir: str | Pat
         print("Sent high-severity alerts to SPEND_ALERT_WEBHOOK")
 
 
-def demo(out_dir: str | Path = ".") -> None:
+def _print_next_steps(out_dir: str | Path = ".") -> None:
+    """Tell a first-time user what they just got and where to go next."""
+    out = Path(out_dir)
+    print("\nWhat you got:")
+    print(f"  {out / 'report.html'}       static dashboard (spend, rail mix, alerts)")
+    print(f"  {out / 'alerts.json'}       machine-readable alerts")
+    print(f"  {out / 'run-summary.json'}  spend and alert summary")
+    print("\nNext: connect your real spend")
+    print("  spend-collector init      scaffold spend.config.json and check your env vars")
+    print("  spend-collector pull-all --config spend.config.json")
+
+
+def demo(out_dir: str | Path = ".", open_report: bool = True, verbose: bool = False) -> None:
     """Run the product demo: LLM + x402 + USDC + Stripe -> ledger -> security signals."""
     llm = _load_fixture("llm_usage.json")
     x402 = _load_fixture("x402_settlements.json")
@@ -451,7 +479,7 @@ def demo(out_dir: str | Path = ".") -> None:
         store.ingest(from_x402_settlements(x402))
         store.ingest(from_usdc_transfers(usdc))
         store.ingest(from_stripe_events(stripe))
-        _finish_run(store, budgets, out_dir)
+        _finish_run(store, budgets, out_dir, open_report=open_report)
 
         alerts = run_all(store, budgets)
         kinds = {a.kind for a in alerts}
@@ -468,25 +496,91 @@ def demo(out_dir: str | Path = ".") -> None:
         assert any(a.kind == "spend_spike" and a.subject == "research-bot" for a in alerts), alerts
         assert any(a.kind == "new_key_spike" and a.subject == "new-key-bot" for a in alerts), alerts
         assert any(a.kind == "new_merchant_provider" and a.subject == "support-bot" for a in alerts), alerts
-    print("[self-check] cross-rail ledger + Phase-0 security demo -- OK")
+    if verbose:
+        print("[self-check] cross-rail ledger + Phase-0 security demo -- OK")
 
     from .sources import decode_transfer_log
     log = {"topics": ["0x" + "d" * 64, "0x" + "0" * 24 + "11" * 20, "0x" + "0" * 24 + "22" * 20],
            "data": "0x" + format(2_500_000, "064x"), "transactionHash": "0xabc", "blockNumber": "0x10"}
     decoded = decode_transfer_log(log)
     assert decoded["to"] == "0x" + "22" * 20 and decoded["amount_raw"] == 2_500_000
-    print("[self-check] x402 Transfer decoder -- OK")
+    if verbose:
+        print("[self-check] x402 Transfer decoder -- OK")
 
     event = {"id": "evt_1", "created": 1781740800, "type": "payment_intent.succeeded",
              "data": {"object": {"id": "pi_1", "amount_received": 4200, "currency": "usd",
                                   "metadata": {"agent_id": "ops-bot", "budget_id": "team-ops"}}}}
     stripe_event = from_stripe_events([event])[0]
     assert stripe_event.billed_cost == 42.0 and stripe_event.rail == "card"
-    print("[self-check] Stripe payment mapping -- OK")
+    if verbose:
+        print("[self-check] Stripe payment mapping -- OK")
+
+    _print_next_steps(out_dir)
+
+
+def _check_rail_env(config: dict) -> None:
+    """Print an env-var / placeholder checklist for every enabled rail."""
+    rails = config.get("rails")
+    if not isinstance(rails, dict):
+        print("  (no rails configured)")
+        return
+    lines: list[str] = []
+    for name, cfg in rails.items():
+        if not isinstance(cfg, dict) or not _enabled(cfg, default=False):
+            continue
+        # Any config key ending in _env names an environment variable to check.
+        env_keys = [str(v) for k, v in cfg.items() if k.endswith("_env") and v]
+        for var in env_keys:
+            if os.environ.get(var):
+                lines.append(f"  [ok]      {name}: {var} set")
+            else:
+                lines.append(f"  [missing] {name}: {var} not set -- export it before pull-all")
+        # Receiving addresses still holding the placeholder are not usable.
+        pay_to = cfg.get("pay_to")
+        if isinstance(pay_to, str) and pay_to.startswith("0xYour"):
+            lines.append(f"  [missing] {name}: pay_to is still the placeholder -- edit it to your address")
+        elif isinstance(pay_to, str) and pay_to:
+            lines.append(f"  [ok]      {name}: pay_to = {pay_to}")
+        # File-backed rails (e.g. GCP billing export) need the file present.
+        billing_file = cfg.get("billing_export_file")
+        if isinstance(billing_file, str) and billing_file:
+            if Path(billing_file).exists():
+                lines.append(f"  [ok]      {name}: {billing_file} found")
+            else:
+                lines.append(f"  [missing] {name}: {billing_file} not found -- create it before pull-all")
+    if lines:
+        print("Enabled rails:")
+        for line in lines:
+            print(line)
+    else:
+        print("No rails are enabled yet. Set rails.<name>.enabled = true in the config.")
+
+
+def init(config_path: str | Path = "spend.config.json", force: bool = False) -> None:
+    """Scaffold spend.config.json from the example and check the env it needs."""
+    dest = Path(config_path)
+    if dest.exists() and not force:
+        print(f"{dest} already exists. Edit it, or pass --force to overwrite from the example.")
+    else:
+        dest.write_text(_CONFIG_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"Wrote {dest} from the example template.")
+
+    try:
+        config = _load_json_file(dest)
+    except (OSError, ValueError) as exc:
+        print(f"Could not read {dest}: {exc}")
+        sys.exit(1)
+
+    print()
+    _check_rail_env(config)
+    print("\nNext:")
+    print(f"  1. Edit {dest}: set budgets, wallets, and enable the rails you use.")
+    print("  2. Export the environment variables marked [missing] above.")
+    print(f"  3. spend-collector pull-all --config {dest}")
 
 
 def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
-         provider: str = "anthropic") -> None:
+         provider: str = "anthropic", open_report: bool = False) -> None:
     """Pull real LLM cost data (read-only admin key). provider: anthropic | openai."""
     from .sources import (env_admin_key, env_openai_key, fetch_anthropic_cost_report,
                           fetch_openai_costs, from_llm_cost_rows)
@@ -509,12 +603,13 @@ def pull(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int 
     with SpendStore(str(db_path)) as store:
         n = store.ingest(from_llm_cost_rows(rows))
         print(f"ingested {n} {provider} cost rows -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_openrouter(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
                     generation_ids: list[str] | None = None,
-                    generation_ids_file: str | Path | None = None) -> None:
+                    generation_ids_file: str | Path | None = None,
+                    open_report: bool = False) -> None:
     """Pull OpenRouter generation metadata by generation id."""
     from .sources import env_openrouter_key, fetch_openrouter_generations, from_openrouter_generation_rows
     key = env_openrouter_key()
@@ -532,11 +627,12 @@ def pull_openrouter(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
     with SpendStore(str(db_path)) as store:
         n = store.ingest(from_openrouter_generation_rows(fetch_openrouter_generations(key, ids)))
         print(f"ingested {n} OpenRouter generations -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_aws(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
-             tag_agent: str = "agent_id", tag_budget: str = "budget_id") -> None:
+             tag_agent: str = "agent_id", tag_budget: str = "budget_id",
+             open_report: bool = False) -> None:
     """Pull AWS Cost Explorer spend grouped by agent/budget cost allocation tags."""
     from .sources import (
         env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token,
@@ -560,13 +656,14 @@ def pull_aws(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: 
             tag_budget=tag_budget,
         )))
         print(f"ingested {n} AWS cost rows -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_gcp_billing_file(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
                           billing_export_file: str | Path | None = None,
                           label_agent: str = "agent_id",
-                          label_budget: str = "budget_id") -> None:
+                          label_budget: str = "budget_id",
+                          open_report: bool = False) -> None:
     """Pull GCP Cloud Billing export rows from a JSON/NDJSON/CSV file."""
     from .sources import load_gcp_billing_export, from_gcp_billing_rows
     if not billing_export_file:
@@ -577,7 +674,7 @@ def pull_gcp_billing_file(db_path: str | Path = "spend.db", out_dir: str | Path 
         rows = load_gcp_billing_export(billing_export_file)
         n = store.ingest(from_gcp_billing_rows(rows, label_agent=label_agent, label_budget=label_budget))
         print(f"ingested {n} GCP billing rows -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def _azure_token_from_env_or_sp(env: dict | None = None) -> str | None:
@@ -596,7 +693,7 @@ def _azure_token_from_env_or_sp(env: dict | None = None) -> str | None:
 
 def pull_azure(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days: int = 7,
                scope: str | None = None, tag_agent: str = "agent_id",
-               tag_budget: str = "budget_id") -> None:
+               tag_budget: str = "budget_id", open_report: bool = False) -> None:
     """Pull Azure Cost Management spend grouped by agent/budget tags."""
     from .sources import fetch_azure_cost_usage, from_azure_cost_rows
     scope = scope or os.environ.get("AZURE_COST_SCOPE")
@@ -621,12 +718,12 @@ def pull_azure(db_path: str | Path = "spend.db", out_dir: str | Path = ".", days
             tag_budget=tag_budget,
         )))
         print(f"ingested {n} Azure cost rows -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
               pay_to: str | None = None, lookback_blocks: int = 2000,
-              wallet_map_path: str | Path | None = None) -> None:
+              wallet_map_path: str | Path | None = None, open_report: bool = False) -> None:
     """Pull real x402 settlements (USDC into a merchant address on Base, read-only RPC)."""
     from .sources import env_pay_to, fetch_base_usdc_transfers
     pay_to = pay_to or env_pay_to()
@@ -641,12 +738,12 @@ def pull_x402(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
             wallet_map=_load_wallet_map(wallet_map_path),
         ))
         print(f"ingested {n} x402 settlements -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_usdc(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
               pay_to: str | None = None, lookback_blocks: int = 2000,
-              wallet_map_path: str | Path | None = None) -> None:
+              wallet_map_path: str | Path | None = None, open_report: bool = False) -> None:
     """Pull direct USDC transfers into a wallet on Base (read-only public RPC)."""
     from .sources import env_usdc_pay_to, fetch_base_usdc_transfers
     pay_to = pay_to or env_usdc_pay_to()
@@ -661,11 +758,11 @@ def pull_usdc(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
             wallet_map=_load_wallet_map(wallet_map_path),
         ))
         print(f"ingested {n} USDC transfers -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def pull_stripe(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
-                days: int = 7, limit: int = 100) -> None:
+                days: int = 7, limit: int = 100, open_report: bool = False) -> None:
     """Pull real card payments via the Stripe Events API (read-only, restricted key)."""
     from .sources import env_stripe_key, fetch_stripe_payment_intent_events
     key = env_stripe_key()
@@ -677,7 +774,7 @@ def pull_stripe(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
     with SpendStore(str(db_path)) as store:
         n = store.ingest(from_stripe_events(fetch_stripe_payment_intent_events(key, days=days, limit=limit)))
         print(f"ingested {n} Stripe payments -> {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def _configured_env(cfg: dict, default_name: str) -> str | None:
@@ -686,7 +783,7 @@ def _configured_env(cfg: dict, default_name: str) -> str | None:
 
 
 def pull_all(config_path: str | Path | None = None, db_path: str | Path | None = None,
-             out_dir: str | Path | None = None) -> None:
+             out_dir: str | Path | None = None, open_report: bool = False) -> None:
     """Pull every configured rail into one ledger, then render once."""
     from .sources import (
         env_aws_access_key_id, env_aws_secret_access_key, env_aws_session_token,
@@ -846,10 +943,11 @@ def pull_all(config_path: str | Path | None = None, db_path: str | Path | None =
             else:
                 print("skipped stripe: set STRIPE_SECRET_KEY or rails.stripe.api_key_env")
 
-        _finish_run(store, budgets, out_dir)
+        _finish_run(store, budgets, out_dir, open_report=open_report)
 
 
-def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
+def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".",
+           open_report: bool = False) -> None:
     """Regenerate report.html from an existing SQLite ledger."""
     if not Path(db_path).exists():
         print(f"ledger not found: {db_path}")
@@ -859,7 +957,7 @@ def report(db_path: str | Path = "spend.db", out_dir: str | Path = ".") -> None:
             print(f"{db_path} is empty -- run a pull first (pull / pull-x402 / pull-usdc / pull-stripe).")
             sys.exit(1)
         print(f"loaded ledger {db_path}")
-        _finish_run(store, _load_budgets(), out_dir)
+        _finish_run(store, _load_budgets(), out_dir, open_report=open_report)
 
 
 def _load_policy(path: str | Path | None) -> dict:
@@ -1570,18 +1668,51 @@ def release_reservation_cmd(db_path: str, request_id: str) -> None:
     print(json.dumps({"request_id": request_id, "released": released}, indent=2, sort_keys=True))
 
 
+_EPILOG = """\
+Common commands:
+  demo        one-command product demo (auto-opens report.html)
+  init        scaffold spend.config.json and check your env vars
+  pull-all    pull every enabled rail from one config, then render
+  report      rebuild the dashboard from an existing ledger
+
+Single-rail pulls (debug one source at a time):
+  pull, pull-openrouter, pull-aws, pull-gcp-billing-file,
+  pull-azure, pull-x402, pull-usdc, pull-stripe
+
+Gateway & safety:
+  gateway, guard, validate-policy, audit-config,
+  release-reservation, freeze, unfreeze
+
+Add --open to any command above to open report.html in your browser.
+"""
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spend-collector",
         description="Read-only cross-rail agent spend collector.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--out-dir", default=".", help="directory for report.html and JSON artifacts")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--out-dir", default=argparse.SUPPRESS,
                         help="directory for report.html and JSON artifacts")
+    # Tri-state: None (unset) lets each command pick its default (demo opens, others don't).
+    common.add_argument("--open", action=argparse.BooleanOptionalAction, default=None,
+                        help="open report.html in your browser when the run finishes")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("demo", parents=[common], help="run the fixture-backed product demo")
+    sub.add_parser("help", help="show this help message and exit")
+
+    demo_p = sub.add_parser("demo", parents=[common], help="run the fixture-backed product demo")
+    demo_p.add_argument("--verbose", action="store_true", help="print internal self-check lines")
+
+    init_p = sub.add_parser("init", help="scaffold spend.config.json and check your env vars")
+    init_p.add_argument("--config", default="spend.config.json",
+                        help="config path to write; defaults to spend.config.json")
+    init_p.add_argument("--force", action="store_true", help="overwrite an existing config from the example")
 
     pull_p = sub.add_parser("pull", parents=[common], help="pull LLM cost rows (Anthropic or OpenAI)")
     pull_p.add_argument("--db", default="spend.db", help="SQLite ledger path")
@@ -1693,32 +1824,47 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     cmd = args.cmd or "demo"
+    if cmd == "help":
+        parser.print_help()
+        return
+    # --open is tri-state: unset means demo opens the report and other commands don't.
+    open_flag = getattr(args, "open", None)
     if cmd == "demo":
-        demo(args.out_dir)
+        demo(args.out_dir, open_report=True if open_flag is None else open_flag,
+             verbose=getattr(args, "verbose", False))
+    elif cmd == "init":
+        init(args.config, args.force)
     elif cmd == "pull":
-        pull(args.db, args.out_dir, args.days, args.provider)
+        pull(args.db, args.out_dir, args.days, args.provider, open_report=bool(open_flag))
     elif cmd == "pull-openrouter":
-        pull_openrouter(args.db, args.out_dir, args.generation_id, args.generation_ids_file)
+        pull_openrouter(args.db, args.out_dir, args.generation_id, args.generation_ids_file,
+                        open_report=bool(open_flag))
     elif cmd == "pull-aws":
-        pull_aws(args.db, args.out_dir, args.days, args.tag_agent, args.tag_budget)
+        pull_aws(args.db, args.out_dir, args.days, args.tag_agent, args.tag_budget,
+                 open_report=bool(open_flag))
     elif cmd == "pull-gcp-billing-file":
         pull_gcp_billing_file(
             args.db, args.out_dir, args.billing_export_file, args.label_agent, args.label_budget,
+            open_report=bool(open_flag),
         )
     elif cmd == "pull-azure":
-        pull_azure(args.db, args.out_dir, args.days, args.scope, args.tag_agent, args.tag_budget)
+        pull_azure(args.db, args.out_dir, args.days, args.scope, args.tag_agent, args.tag_budget,
+                   open_report=bool(open_flag))
     elif cmd == "pull-all":
-        pull_all(args.config, args.db, args.out_dir)
+        pull_all(args.config, args.db, args.out_dir, open_report=bool(open_flag))
     elif cmd == "pull-x402":
-        pull_x402(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map)
+        pull_x402(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map,
+                  open_report=bool(open_flag))
     elif cmd == "pull-usdc":
-        pull_usdc(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map)
+        pull_usdc(args.db, args.out_dir, args.pay_to, args.lookback_blocks, args.wallet_map,
+                  open_report=bool(open_flag))
     elif cmd == "pull-stripe":
-        pull_stripe(args.db, args.out_dir, args.days, args.limit)
+        pull_stripe(args.db, args.out_dir, args.days, args.limit, open_report=bool(open_flag))
     elif cmd == "report":
-        report(args.db, args.out_dir)
+        report(args.db, args.out_dir, open_report=bool(open_flag))
     elif cmd == "guard":
         guard(args)
     elif cmd == "gateway":
