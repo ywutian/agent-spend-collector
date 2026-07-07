@@ -26,6 +26,7 @@ from .gateway import (
     record_x402_settlement,
     require_valid_policy,
     validate_policy as validate_policy_data,
+    worst_case_amount,
 )
 from .providers import llm_provider
 from .report import render
@@ -1336,10 +1337,12 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             budget = self.headers.get("x-budget-id") or provider.get("budget", "default")
             if not agent:
                 raise ValueError("provider-compatible calls require X-Agent-ID or provider.agent")
+            flat = float(provider.get("amount", provider.get("max_estimated_amount", 0)) or 0)
+            worst = worst_case_amount(payload, provider)  # per-request LLM ceiling
             return {
                 "agent": agent,
                 "rail": provider.get("rail", "llm_token"),
-                "amount": provider.get("amount", provider.get("max_estimated_amount", 0)),
+                "amount": max(flat, worst) if worst is not None else flat,
                 "budget": budget,
                 "provider": provider.get("provider", provider_id),
                 "service": service or provider.get("service", suffix),
@@ -1380,15 +1383,20 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             try:
                 with urllib.request.urlopen(req, timeout=float(provider.get("timeout", 30))) as resp:
                     raw = self._send_upstream(resp)
-                # Close the loop: record the actual spend, then release the pre-spend
-                # reservation so the budget reflects real usage, not the estimate.
+                # Close the loop: record the actual spend from the response usage.
                 if raw is not None and guard_payload is not None:
                     with SpendStore(str(db_path)) as store:
-                        recorded = record_forwarded_spend(store, raw, provider, guard_payload)
-                        if recorded is not None and request_id:
-                            store.release_reservation(request_id)
+                        record_forwarded_spend(store, raw, provider, guard_payload)
             except urllib.error.HTTPError as exc:
                 self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
+            finally:
+                # Always release the pre-spend hold once the call returns: any recorded
+                # spend is already in the ledger, and leaving a worst-case hold to its TTL
+                # would over-deny later calls. Unmeasured spend (e.g. a stream without
+                # usage) is reconciled by the read-only pull, not by a lingering hold.
+                if request_id:
+                    with SpendStore(str(db_path)) as store:
+                        store.release_reservation(request_id)
 
         def do_GET(self) -> None:
             parsed = urllib.parse.urlsplit(self.path)

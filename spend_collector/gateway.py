@@ -410,6 +410,45 @@ def rate_cap_for_request(policy: dict, req: GuardRequest) -> float | None:
     return _hourly_cap(policy, req.x_budget_id)
 
 
+def _estimate_input_tokens(payload: dict) -> int:
+    # ponytail: chars/4 over the prompt/messages text -- a rough token count. A real
+    # tokenizer would be exact, but for a pre-spend *hold* over-estimating only errs
+    # safe (a bigger reservation), so the cheap heuristic is the right ceiling here.
+    msgs = payload.get("messages")
+    if isinstance(msgs, list):
+        text = " ".join(
+            str(m.get("content", "")) if isinstance(m, dict) else str(m) for m in msgs
+        )
+    else:
+        text = str(payload.get("prompt") or payload.get("input") or "")
+    return len(text) // 4
+
+
+def worst_case_amount(payload: dict, provider: dict) -> float | None:
+    """Worst-case cost of an LLM request, for the pre-spend hold.
+
+    Prices the model at estimated input tokens + the request's max output tokens
+    (or a per-provider ``max_output_tokens`` cap). Returns None when output can't be
+    bounded -- no ``max_tokens`` on the request and no configured cap -- so the caller
+    keeps its flat configured amount. This turns the reservation from a static
+    per-provider guess into a per-request ceiling: a single ``max_tokens: 100000``
+    call on an expensive model now holds its true worst case, not a flat number.
+    """
+    if str(provider.get("rail", "llm_token")) != "llm_token":
+        return None
+    model = payload.get("model")
+    if not model:
+        return None
+    max_out = (
+        payload.get("max_tokens")
+        or payload.get("max_completion_tokens")
+        or provider.get("max_output_tokens")
+    )
+    if not max_out:
+        return None
+    return _price(str(model), _estimate_input_tokens(payload), int(max_out))
+
+
 def record_forwarded_spend(store: SpendStore, raw: bytes, provider: dict, guard_payload: dict):
     """Record a forwarded LLM call as a spend event from the response's token usage.
 
