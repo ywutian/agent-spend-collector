@@ -4,114 +4,148 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 
-**See and govern every dollar your AI agents spend, across every rail.**
+[![English](https://img.shields.io/badge/README-English-blue)](#english)
+[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-red)](#中文)
 
-A free, read-only, cross-rail **agent spend collector**. It pulls what your agents
-spend (LLM token cost + x402 payments + direct USDC transfers + AWS/GCP/Azure cloud cost + Stripe card payments),
-normalizes it into **one [FOCUS](https://focus.finops.org/)-shaped ledger**, and
-flags anomalies: runaway loops, cost spikes, budget burn. **It never touches your
-money** (read-only), so it clears security review on day one.
+## English
 
-> Why this exists: FinOps tools track token cost, payment startups track payments.
-> Nobody gives you one neutral book of record across all of it, and nobody reads
-> agent spend as a security signal. A cost spike is also how a hijacked key or a
-> prompt-injected agent can look. That gap is the product.
+**A read-only spend ledger and safety layer for AI agents.**
 
-## Quick start (no dependencies, no keys)
+`agent-spend-collector` collects LLM token cost, x402 payments, direct USDC transfers, AWS/GCP/Azure cloud cost, and Stripe card payments into one FOCUS-shaped ledger. It then flags runaway loops, spend spikes, budget burn, new keys, and new merchants.
+
+Collection is read-only. It does not move your money, and provider keys, wallet keys, prompts, request bodies, and completions should stay outside the ledger and dashboard.
+
+### Quick Start
+
+Run the full demo with no dependencies and no real keys:
 
 ```bash
 python3 -m spend_collector demo
 ```
 
-Runs the full loop on mock data:
+Then open `report.html`.
+
+The demo path is:
 
 ```text
-fixtures -> one ledger -> anomaly detectors -> report.html
+fixtures -> one SQLite ledger -> anomaly detectors -> report.html
 ```
 
-Open `report.html` in a browser.
+Expected outputs:
 
-## What the demo proves
-
-The demo is a security + cross-rail product demo, not random sample data. It reads
-public fixtures from `fixtures/`:
-
-| Fixture | Purpose |
+| File | Meaning |
 |---|---|
-| `llm_usage.json` | LLM token baseline, runaway token spike, and a new high-spend key |
-| `x402_settlements.json` | Paid API calls settled in USDC on the x402 rail |
-| `usdc_transfers.json` | Direct Base USDC wallet/smart-account payments |
-| `stripe_events.json` | Stripe card payments with agent/budget metadata |
-| `budgets.json` | Team caps used by the budget detectors |
+| `report.html` | Static dashboard |
+| `alerts.json` | Machine-readable alerts |
+| `run-summary.json` | Spend and alert summary |
 
-Those fixtures intentionally trigger the core Phase-0 signals:
-
-| Signal | Why it fires |
-|---|---|
-| `spend_spike` | `research-bot` has four tiny LLM calls, then one runaway token-heavy call |
-| `spend_per_task` | The same runaway request is expensive versus the agent's task baseline |
-| `budget_burn` | `team-support` crosses its budget after x402 + Stripe + token spend |
-| `budget_burn_rate` | Recent spend is burning monthly budgets too quickly |
-| `new_key_spike` | `new-key-bot` appears for the first time with a large LLM charge |
-| `new_merchant_provider` | `support-bot` spends at a first-seen paid API/card merchant |
-
-The point is to prove the wedge: token cost, paid API spend, and card payments can
-land in one neutral ledger, and abnormal spend can become a security signal.
-
-## Dashboard
-
-Every command that ingests data runs the detectors and writes the static dashboard:
-
-```bash
-python3 -m spend_collector demo
-open report.html
-```
-
-To write artifacts into a directory for CI or scheduled jobs:
+To write outputs to a folder:
 
 ```bash
 python3 -m spend_collector demo --out-dir artifacts
 ```
 
-On Windows, open `report.html` from Explorer or run:
+On Windows:
 
 ```powershell
+python -m spend_collector demo
 start report.html
 ```
 
-The dashboard shows total spend, alert counts, rail mix, budget burn, Phase-0
-security signals, agent-by-rail totals, and recent ledger events. Recent events
-include an Evidence column: the short suffix of a stable `provider:sha256:<hash>`
-pointer to the raw source payload. It is a local HTML file with no server and no
-external assets.
+### Why It Exists
 
-Each run also writes machine-readable artifacts:
+Agents now spend through many rails: model tokens, paid APIs, stablecoins, cloud resources, and cards. Most tools only see one slice. This project gives you one neutral book of record and treats unusual spend as a security signal.
 
-| File | Purpose |
+It helps answer:
+
+- Which agent spent the money?
+- Which rail or provider did it use?
+- Which budget did it burn?
+- Is this normal for that agent?
+- Should the next request be blocked before it spends?
+
+### What It Collects
+
+| Rail | Examples |
 |---|---|
-| `alerts.json` | Alert rows with kind, subject, severity, detail, and value |
-| `run-summary.json` | Total spend, event/agent/rail counts, budgets, and alert counts |
+| LLM token cost | Anthropic, OpenAI, OpenRouter, gateway-recorded usage |
+| Paid API | x402, allowlisted gateway targets |
+| Stablecoin | Base USDC transfers |
+| Cloud | AWS Cost Explorer, GCP Billing Export files, Azure Cost Management |
+| Card | Stripe succeeded PaymentIntents |
 
-To regenerate the dashboard from an existing ledger:
+Each source is normalized into a single `SpendEvent` shape and stored in SQLite. Rows are idempotent, append-only, and include evidence references for audit correlation.
+
+### What It Detects
+
+- `spend_spike`: sudden agent spend spike
+- `spend_per_task`: one task is too expensive
+- `budget_burn`: budget crossed
+- `budget_burn_rate`: budget is burning too fast
+- `new_key_spike`: new key appears with high spend
+- `new_merchant_provider`: new merchant or provider
+- off-hours activity
+
+The demo fixtures intentionally trigger several alerts so you can see the product behavior immediately.
+
+### Real Data
+
+Fast path: copy the example config, fill in only the rails you use, then pull everything configured into the same ledger.
 
 ```bash
-python3 -m spend_collector report
-python3 -m spend_collector report --db path/to/spend.db --out-dir artifacts
+cp spend.config.example.json spend.config.json
+# edit spend.config.json
+python3 -m spend_collector pull-all --config spend.config.json
 ```
 
-## Pre-spend gateway
+Common single-rail pulls:
 
-The collector can also sit in front of agent spend. An agent asks before it
-spends; the gateway returns `allow` or `deny` from policy plus ledger history.
+```bash
+# LLM cost: Anthropic or OpenAI
+export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
+python3 -m spend_collector pull --provider anthropic --db spend.db --days 7 --out-dir artifacts
 
-## Trust model
+# OpenRouter generation metadata
+export OPENROUTER_API_KEY=sk-or-...
+python3 -m spend_collector pull-openrouter --generation-id gen_... --db spend.db --out-dir artifacts
 
-The gateway is self-hosted by default. Real provider keys should stay in your
-environment variables or secret manager, not in policy files. Agents receive only
-gateway tokens; the gateway swaps that token for a provider key only after an
-allow decision. The project does not call project-owned servers, and gateway
-audit logs store metadata only: no prompts, request bodies, completions,
-responses, provider keys, or gateway tokens. See `SECURITY.md`.
+# Stripe card payments
+export STRIPE_SECRET_KEY=rk_live_...
+python3 -m spend_collector pull-stripe --db spend.db --days 7 --out-dir artifacts
+
+# Base USDC / x402
+python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
+python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
+```
+
+Cloud examples:
+
+```bash
+python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id
+python3 -m spend_collector pull-gcp-billing-file --billing-export-file gcp-billing-export.ndjson
+python3 -m spend_collector pull-azure --scope "$AZURE_COST_SCOPE"
+```
+
+Budget caps can be supplied with `SPEND_BUDGETS_FILE`:
+
+```bash
+export SPEND_BUDGETS_FILE=budgets.json
+```
+
+Example:
+
+```json
+{
+  "team-research": 10.0,
+  "team-support": 8.0
+}
+```
+
+For scheduling, retention, webhooks, and incident handling, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
+### Pre-Spend Gateway
+
+The collector can also run as a local gateway. Agents ask before spending; the gateway returns `allow` or `deny` from policy plus ledger history.
 
 Try a one-off decision:
 
@@ -129,113 +163,60 @@ python3 -m spend_collector guard \
   --enforce-exit-code
 ```
 
-Or run a local HTTP gateway:
+Run the HTTP gateway:
 
 ```bash
+export SPEND_GATEWAY_TOKEN=dev-gateway-token
+python3 -m spend_collector validate-policy --policy gateway.example.json
 python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
 ```
 
-Then call it before a payment/model call:
+Call it before a spend:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/guard \
-  -H 'content-type: application/json' \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer dev-gateway-token" \
   -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":3.5,"budget":"team-research"}'
 ```
 
-For calls the gateway should forward, define an allowlisted `targets` entry in
-`gateway.example.json`, then call `/forward`:
+The gateway can also:
+
+- proxy allowlisted API calls with `/forward`
+- proxy OpenAI-compatible provider routes after policy checks
+- serve x402 resources at `/x402/<resource-id>`
+- create and release short-lived spend reservations
+- freeze or unfreeze agents and budgets as an incident kill-switch
+- block on deterministic request-content rules or recent anomalies
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and [`SECURITY.md`](SECURITY.md) before using the gateway in production.
+
+### Dashboard
+
+Every ingest command writes a local static dashboard:
 
 ```bash
-curl -X POST http://127.0.0.1:8787/forward \
-  -H 'content-type: application/json' \
-  -d '{"agent":"research-bot","target":"scraper-demo","body":{"query":"pricing data"}}'
+python3 -m spend_collector report --db spend.db --out-dir artifacts
 ```
 
-The gateway checks the target's policy first. If allowed, it forwards the request
-body to the configured URL. If denied, it does not call the target and returns a
-JSON decision such as `{"decision":"deny","allowed":false,"reasons":[...]}`.
-It never returns prompts, rewrites prompts, or injects model instructions.
+The dashboard shows total spend, rail mix, alert counts, budget burn, agent-by-rail totals, recent ledger events, and short evidence hashes. It uses no server and no external assets.
 
-For true x402 seller-side middleware, define an `x402_resources` entry. The
-gateway exposes it at `/x402/<resource-id>`:
+### Project Map
 
-```bash
-# First request: no payment yet, returns HTTP 402 + PAYMENT-REQUIRED.
-curl -i http://127.0.0.1:8787/x402/scraper-paid \
-  -H 'X-Agent-ID: research-bot' \
-  -H 'X-Budget-ID: team-research'
+| Path | Role |
+|---|---|
+| `spend_collector/schema.py` | `SpendEvent` data shape |
+| `spend_collector/store.py` | SQLite ledger |
+| `spend_collector/adapters.py` | Source normalizers |
+| `spend_collector/sources.py` | Read-only provider pulls |
+| `spend_collector/detectors.py` | Anomaly detectors |
+| `spend_collector/gateway.py` | Policy decisions |
+| `spend_collector/report.py` | Static dashboard |
+| `spend_collector/providers.py` | Provider catalog and pricing helpers |
+| `fixtures/` | Demo data |
+| `docs/OPERATIONS.md` | Production runbook |
 
-# Second request: x402-capable clients retry with PAYMENT-SIGNATURE.
-curl -i http://127.0.0.1:8787/x402/scraper-paid \
-  -H 'content-type: application/json' \
-  -H 'X-Agent-ID: research-bot' \
-  -H 'X-Budget-ID: team-research' \
-  -H "PAYMENT-SIGNATURE: $PAYMENT_SIGNATURE" \
-  -d '{"query":"pricing data"}'
-```
-
-On the paid retry, the gateway checks policy and budget, verifies and settles the
-payment through the configured x402 facilitator, forwards the request to the
-protected upstream only after settlement, returns `PAYMENT-RESPONSE`, and records
-the settlement on the `api_x402` rail. It also accepts the legacy `X-PAYMENT`
-header for clients that still use that spelling. The signed payment payload is
-bound to the configured `amount`, `pay_to`, `network`, `asset`, and
-`resource_url` (or `url` when `resource_url` is omitted), so a payment signed for
-one resource cannot be reused against another configured resource.
-
-For SDKs that support a custom base URL, put the real provider key only on the
-gateway and give the agent a gateway token:
-
-```bash
-export OPENAI_API_KEY=sk-real-provider-key
-export OPENROUTER_API_KEY=sk-or-real-provider-key
-export SPEND_GATEWAY_TOKEN=dev-gateway-token
-python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
-```
-
-Then point the agent's OpenAI-compatible SDK at the gateway:
-
-```text
-base_url = http://127.0.0.1:8787/openai/v1
-api_key = dev-gateway-token
-headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
-```
-
-For OpenRouter, use the same SDK shape and change only the provider path:
-
-```text
-base_url = http://127.0.0.1:8787/openrouter/v1
-api_key = dev-gateway-token
-headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
-```
-
-The gateway checks policy, replaces the gateway token with the provider key, and
-forwards the original request only when allowed. OpenRouter responses include
-usage and cost metadata, so successful gateway calls are recorded with the
-actual OpenRouter charge instead of a local price estimate.
-
-Validate and audit the gateway config before starting it:
-
-```bash
-python3 -m spend_collector validate-policy --policy gateway.example.json
-python3 -m spend_collector audit-config --policy gateway.example.json
-```
-
-If an allowed downstream call fails before money moves, release its hold:
-
-```bash
-python3 -m spend_collector release-reservation --db spend.db --request-id req_123
-```
-
-This is the first inline-control layer: provider proxy routes do not move funds,
-while `/x402/<resource-id>` routes settle an already-signed x402 payment before
-delivering the protected resource. Callers should block the spend when the
-decision is `deny`.
-
-## Verify locally
-
-The project needs no required dependencies. Run the test suite and product demo with:
+### Local Verification
 
 ```bash
 python3 -m unittest discover -s tests
@@ -243,95 +224,151 @@ python3 -m compileall spend_collector tests
 python3 -m spend_collector demo
 ```
 
-The tests cover ledger idempotency, rail adapters, x402 log decoding, Phase-0
-detectors, fixtures, and dashboard rendering.
+The project has no required third-party dependencies. Optional pricing support:
 
-## Real data (read-only)
+```bash
+pip install ".[pricing]"
+```
 
-Fastest setup: copy one config, fill the addresses/env-var names you use, then
-pull every configured rail into the same ledger.
+### Open Source Boundary
+
+This repository is MIT-licensed and includes the collector, SQLite ledger, detectors, dashboard, pricing helpers, and self-hosted gateway.
+
+What is not included: a hosted enterprise control plane with SSO/RBAC, multi-tenancy, managed HA, SOC 2 controls, approval workflows, SIEM/ITSM integrations, policy UI, and role-scoped chargeback.
+
+### Requirements and License
+
+- Python 3.10+
+- No required dependencies
+- Optional: `tokencost` via `pip install ".[pricing]"`
+- License: MIT
+
+## 中文
+
+**给 AI Agent 用的只读花费账本和安全控制层。**
+
+`agent-spend-collector` 会把 LLM token 成本、x402 支付、USDC 转账、AWS/GCP/Azure 云账单和 Stripe 卡支付统一写进一张 FOCUS 形态的账本，然后检测循环失控、费用暴涨、预算烧穿、新 key 异常、新商户等风险。
+
+采集阶段是只读的，不会动你的钱。provider key、钱包私钥、prompt、请求体和模型输出都不应该进入账本或 dashboard。
+
+### 快速开始
+
+无需依赖、无需真实 key，直接跑完整 demo：
+
+```bash
+python3 -m spend_collector demo
+```
+
+然后打开 `report.html`。
+
+demo 会完成这条链路：
+
+```text
+fixtures -> one SQLite ledger -> anomaly detectors -> report.html
+```
+
+输出文件：
+
+| 文件 | 作用 |
+|---|---|
+| `report.html` | 静态看板 |
+| `alerts.json` | 机器可读的告警 |
+| `run-summary.json` | 花费和告警汇总 |
+
+如果要把产物写到目录里：
+
+```bash
+python3 -m spend_collector demo --out-dir artifacts
+```
+
+Windows 下可以运行：
+
+```powershell
+python -m spend_collector demo
+start report.html
+```
+
+### 为什么需要它
+
+现在 Agent 的花费可能来自很多地方：模型 token、付费 API、稳定币、云资源、银行卡。大多数工具只能看到其中一部分。这个项目的目标是给你一张中立的总账，并把异常花费当成安全信号来看。
+
+它可以回答这些问题：
+
+- 哪个 Agent 花的钱？
+- 走的是哪条支付或账单通道？
+- 消耗的是哪个预算？
+- 这对该 Agent 来说是否异常？
+- 下一次请求是否应该在花钱前被拦住？
+
+### 支持的数据来源
+
+| 通道 | 示例 |
+|---|---|
+| LLM token 成本 | Anthropic, OpenAI, OpenRouter, gateway 记录的 usage |
+| 付费 API | x402, 网关 allowlist 里的目标服务 |
+| 稳定币 | Base USDC transfers |
+| 云账单 | AWS Cost Explorer, GCP Billing Export files, Azure Cost Management |
+| 卡支付 | Stripe succeeded PaymentIntents |
+
+所有来源都会被归一化成同一种 `SpendEvent`，写入 SQLite。账本是幂等追加的，并保留审计用的证据引用。
+
+### 会检测什么
+
+- `spend_spike`：单个 Agent 花费突增
+- `spend_per_task`：单次任务成本异常
+- `budget_burn`：预算被烧穿
+- `budget_burn_rate`：预算消耗速度过快
+- `new_key_spike`：新 key 首次出现就高消费
+- `new_merchant_provider`：新商户或新 provider
+- 非工作时间活动
+
+demo 数据会故意触发多个告警，方便你一跑就看到效果。
+
+### 接入真实数据
+
+最快方式：复制示例配置，只填你实际用到的数据来源，然后统一拉入同一个账本。
 
 ```bash
 cp spend.config.example.json spend.config.json
-# edit spend.config.json: receiving addresses, enabled rails, wallet -> agent/budget map
+# edit spend.config.json
 python3 -m spend_collector pull-all --config spend.config.json
 ```
 
-The `wallets` map is what turns chain addresses into useful agent spend:
-
-```json
-{
-  "0xresearchwallet": {
-    "agent_id": "research-bot",
-    "budget_id": "team-research"
-  }
-}
-```
-
-For direct USDC only, use the small form:
+常见单来源拉取：
 
 ```bash
-python3 -m spend_collector pull-usdc \
-  --pay-to 0xYourReceivingAddress \
-  --wallet-map wallet-map.example.json \
-  --db spend.db \
-  --out-dir artifacts
-```
-
-Single-rail pulls still work:
-
-```bash
-# LLM token cost (admin/usage key, read-only)
+# LLM cost: Anthropic or OpenAI
 export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
-python3 -m spend_collector pull --db spend.db --days 7 --out-dir artifacts
+python3 -m spend_collector pull --provider anthropic --db spend.db --days 7 --out-dir artifacts
 
-# OpenRouter generation metadata by generation id
+# OpenRouter generation metadata
 export OPENROUTER_API_KEY=sk-or-...
 python3 -m spend_collector pull-openrouter --generation-id gen_... --db spend.db --out-dir artifacts
 
-# AWS cloud cost: Cost Explorer grouped by cost allocation tags
-export AWS_ACCESS_KEY_ID=AKIA...
-export AWS_SECRET_ACCESS_KEY=...
-python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id --db spend.db --out-dir artifacts
-
-# GCP cloud cost: BigQuery Cloud Billing export rows saved as JSON/NDJSON/CSV
-python3 -m spend_collector pull-gcp-billing-file \
-  --billing-export-file gcp-billing-export.ndjson \
-  --label-agent agent_id \
-  --label-budget budget_id \
-  --db spend.db \
-  --out-dir artifacts
-
-# Azure cloud cost: Cost Management grouped by tags
-export AZURE_COST_SCOPE=/subscriptions/00000000-0000-0000-0000-000000000000
-export AZURE_ACCESS_TOKEN="$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv)"
-python3 -m spend_collector pull-azure \
-  --scope "$AZURE_COST_SCOPE" \
-  --tag-agent agent_id \
-  --tag-budget budget_id \
-  --db spend.db \
-  --out-dir artifacts
-
-# x402 payments: USDC settlements into your merchant address on Base
-python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
-
-# direct USDC payments: Base USDC transfers into your receiving address
-python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.json
-
-# card payments: Stripe succeeded PaymentIntents (restricted read key)
+# Stripe card payments
 export STRIPE_SECRET_KEY=rk_live_...
 python3 -m spend_collector pull-stripe --db spend.db --days 7 --out-dir artifacts
+
+# Base USDC / x402
+python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
+python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
 ```
 
-All commands write to `spend.db`, run the detectors, and write `report.html`.
-Budget caps can be supplied as a JSON object:
+云账单示例：
+
+```bash
+python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id
+python3 -m spend_collector pull-gcp-billing-file --billing-export-file gcp-billing-export.ndjson
+python3 -m spend_collector pull-azure --scope "$AZURE_COST_SCOPE"
+```
+
+预算可以通过 `SPEND_BUDGETS_FILE` 提供：
 
 ```bash
 export SPEND_BUDGETS_FILE=budgets.json
-python3 -m spend_collector pull-stripe
 ```
 
-Example `budgets.json`:
+示例：
 
 ```json
 {
@@ -340,131 +377,104 @@ Example `budgets.json`:
 }
 ```
 
-For production scheduling, artifact retention, and incident handling, see
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md). A safe starting config is provided in
-`spend.config.example.json`, `wallet-map.example.json`, `.env.example`, and
-`budgets.example.json`.
+生产调度、产物保留、webhook 告警和事件处理请看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
 
-Or do it all at once: **`scripts/dogfood.sh`** pulls whatever credentials are set
-and opens the dashboard. After any pull, `python3 -m spend_collector report --db
-spend.db --out-dir artifacts` re-renders the evidence page.
+### 花钱前拦截网关
 
-Attribution:
+这个项目也可以作为本地网关运行。Agent 在花钱前先问网关，网关根据策略和历史账本返回 `allow` 或 `deny`。
 
-- LLM: one API key per agent.
-- OpenRouter: gateway headers (`X-Agent-ID`, `X-Budget-ID`) for live calls; generation metadata `external_user` for post-hoc pulls.
-- AWS: Cost Allocation Tags, default `agent_id` and `budget_id`.
-- GCP: Cloud Billing export labels, default `agent_id` and `budget_id`.
-- Azure: Cost Management tags, default `agent_id` and `budget_id`; use a Cost Management Reader-capable identity.
-- x402: payer wallet.
-- USDC: payer wallet by default; map wallet addresses to agents/budgets upstream.
-- Stripe: `PaymentIntent.metadata.agent_id` and `metadata.budget_id`.
+单次决策示例：
 
-OpenAI can follow the Anthropic cost-report shape. OpenRouter is easiest through
-the gateway because responses include usage and cost metadata.
-
-## Providers and pricing
-
-Agent spend is more than LLM tokens. `spend_collector/providers.py` is a curated
-catalog across three categories (base URLs / unit costs are defaults — verify and
-override per your account):
-
-- **LLM** (forward + record token usage): `openai`, `anthropic`, `gemini`,
-  `cohere`, `groq`, `together`, `fireworks`, `deepinfra`, `deepseek`, `xai`,
-  `mistral`, `perplexity`, `openrouter`, `moonshot`, `dashscope`, `zhipu`,
-  `ollama`, `vllm`.
-- **Paid tools / data APIs** (forward via a `target`, per-call cost): `tavily`,
-  `serper`, `exa`, `brave`, `firecrawl`, `scrapingbee`, `apify`, `elevenlabs`,
-  `deepgram`, `replicate`, `fal`, `e2b`.
-- **Payment rails** (captured by ingestion): `stripe`, `x402` (+ `skyfire`,
-  `coinbase`).
-
-Tool spend is recorded in real time as the target's flat per-call `amount` — enough
-for budget caps and call-volume anomalies. Tools meter differently (audio seconds,
-characters, pages), so treat that as an estimate; the authoritative cost is the
-provider's billed charge, captured separately by `pull-stripe`. They are two views
-of the same spend (real-time estimate on the `api` rail vs. billed truth on the
-`card` rail) — reconcile by comparing them, not by summing; the delta is a signal.
-
-**Naming a known LLM provider is enough** — the gateway fills its base URL and key
-env from the catalog, so a policy entry can be just a budget and cap. Route at
-`/<provider>/...`:
-
-```json
-"providers": { "mistral": {"service_from_body": "model", "amount": 0.25, "budget": "team"} }
+```bash
+python3 -m spend_collector guard \
+  --policy gateway.example.json \
+  --db spend.db \
+  --agent research-bot \
+  --rail api_x402 \
+  --provider x402 \
+  --merchant 0xtool \
+  --service /scrape \
+  --amount 3.50 \
+  --budget team-research \
+  --enforce-exit-code
 ```
 
-Override `base_url`/`api_key_env` for anything custom (self-hosted, Azure, a
-region). Recording auto-detects token usage across **OpenAI**
-(`prompt_tokens`/`completion_tokens`), **Anthropic** (`input_tokens`/
-`output_tokens`), **Gemini** (`usageMetadata`), and **Cohere** (`meta.billed_units`).
+启动 HTTP 网关：
 
-**Pricing:** install `tokencost` (`pip install ".[pricing]"` from a source checkout) for
-accurate, maintained rates across 400+ models. Without it, a small built-in price
-book covers common models and everything else prices at zero until added.
+```bash
+export SPEND_GATEWAY_TOKEN=dev-gateway-token
+python3 -m spend_collector validate-policy --policy gateway.example.json
+python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
+```
 
-## What's inside
+花钱前调用：
 
-| File | Role |
+```bash
+curl -X POST http://127.0.0.1:8787/guard \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer dev-gateway-token" \
+  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":3.5,"budget":"team-research"}'
+```
+
+网关还可以：
+
+- 通过 `/forward` 代理 allowlist 里的 API 请求
+- 在策略检查后代理 OpenAI-compatible provider routes
+- 通过 `/x402/<resource-id>` 提供 x402 资源
+- 创建和释放短期花费预留
+- 冻结或解冻 agent / budget，作为事故 kill-switch
+- 根据确定性的请求内容规则或近期异常进行阻断
+
+生产使用网关前，请先看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 和 [`SECURITY.md`](SECURITY.md)。
+
+### 看板
+
+每次采集都会生成本地静态看板：
+
+```bash
+python3 -m spend_collector report --db spend.db --out-dir artifacts
+```
+
+看板展示总花费、rail 分布、告警数量、预算消耗、Agent x rail 汇总、近期账本事件和短证据哈希。它不需要服务器，也不加载外部资源。
+
+### 项目结构
+
+| 路径 | 作用 |
 |---|---|
-| `schema.py` | FOCUS-shaped `SpendEvent` (one row shape for every rail) |
-| `store.py` | Append-only, idempotent SQLite ledger + summaries |
-| `adapters.py` | Normalizers: token usage / cloud cost / x402 settlements / USDC transfers / Stripe events -> ledger rows |
-| `providers.py` | Curated provider catalog (LLM + tool APIs + payment rails) + usage-shape resolver |
-| `sources.py` | Live read-only pulls: Anthropic/OpenAI cost APIs, OpenRouter generation metadata, AWS Cost Explorer, GCP Billing Export files, Azure Cost Management, Base USDC logs, Stripe Events API |
-| `detectors.py` | Phase-0 anomaly signals: spend spikes, burn-rate, task cost, new keys, new merchants, off-hours activity |
-| `gateway.py` | Pre-spend allow/deny decisions from policy + ledger history |
-| `report.py` | Zero-dependency static HTML dashboard |
+| `spend_collector/schema.py` | `SpendEvent` 数据结构 |
+| `spend_collector/store.py` | SQLite 账本 |
+| `spend_collector/adapters.py` | 数据归一化 |
+| `spend_collector/sources.py` | 只读 provider 拉取 |
+| `spend_collector/detectors.py` | 异常检测 |
+| `spend_collector/gateway.py` | 网关策略决策 |
+| `spend_collector/report.py` | 静态看板 |
+| `spend_collector/providers.py` | provider 目录与价格辅助 |
+| `fixtures/` | demo 数据 |
+| `docs/OPERATIONS.md` | 生产运行手册 |
 
-## The detection ceiling
+### 本地验证
 
-Read-only detects, alerts, and keeps evidence. Each ledger row keeps provider
-receipt metadata plus `x_source_event`, a stable hash of the raw source event used
-for audit correlation without storing secrets in the dashboard. It cannot block a
-payment. Stopping spend needs inline enforcement (LLM gateway / x402 middleware),
-and the unbypassable backstop is on-chain caps (ERC-7715 / Coinbase Spend
-Permissions). That's the roadmap:
-
-```text
-detect -> inline -> on-chain
+```bash
+python3 -m unittest discover -s tests
+python3 -m compileall spend_collector tests
+python3 -m spend_collector demo
 ```
 
-## Roadmap
+项目默认不需要第三方依赖。可选安装更完整的模型价格库：
 
-1. Done: closed loop on mock data (ingest -> ledger -> detect -> report).
-2. Done: real Anthropic cost pull (`pull`).
-3. Done: real x402 pull, on-chain USDC on Base (`pull-x402`).
-4. Done: direct USDC stablecoin rail on Base (`pull-usdc`).
-5. Done: AWS cloud cost rail via Cost Explorer (`pull-aws`).
-6. Done: GCP cloud cost rail via Billing Export files (`pull-gcp-billing-file`).
-7. Done: Azure cloud cost rail via Cost Management (`pull-azure`).
-8. Done: Stripe Events rail, token + crypto + cloud + card in one ledger (`pull-stripe`).
-9. Done: richer Phase-0 detectors (multi-window burn-rate, spend-per-task, new key, new merchant/provider).
-10. Done: inline pre-spend gateway and LLM proxy (`guard`, `/guard`, provider routes).
-11. Done: x402 seller-side middleware with `PAYMENT-REQUIRED`, facilitator verify/settle, and ledger recording.
-12. Next: Grafana/Metabase on the DB; stronger request-bound replay protection for dynamic x402 pricing.
+```bash
+pip install ".[pricing]"
+```
 
-## Open source, and what's commercial
+### 开源边界
 
-Everything in this repository is **MIT-licensed and free** — the read-only
-cross-rail collector, pricing and detectors, the local dashboard, and the
-self-hosted pre-spend gateway (policy, allow/deny, record, reserve/release,
-velocity caps, multi-platform alerts, opt-in AI triage). Self-hosted, single-node,
-single-tenant. Yours to run and extend.
+本仓库使用 MIT 协议，包含采集器、SQLite 账本、检测器、看板、价格辅助逻辑和自托管网关。
 
-What is **not** here — and is a separate commercial product — is the enterprise
-control plane around it: SSO / RBAC / multi-tenancy, managed HA and a hosted data
-layer, SOC 2 / immutable audit / approval workflows, SIEM & ITSM integrations, a
-policy-management UI with simulation, and role-scoped chargeback reporting. The
-open-source engine detects and enforces on one node; the control plane is what
-makes it a governed platform for an org.
+这里不包含托管企业控制台，例如 SSO/RBAC、多租户、高可用托管、SOC 2、审批流、SIEM/ITSM 集成、策略 UI、按角色分摊账单等。
 
-The line is deliberate: the collector should be trivially adoptable and never hold
-your governance hostage, while the operational substrate an enterprise pays for
-stays a product, not a feature.
+### 要求与协议
 
-## License & requirements
-
-Requires Python 3.10+. No required dependencies; optional `tokencost`
-(`pip install ".[pricing]"` from a source checkout) for accurate pricing across 400+ models,
-otherwise a small built-in price book. License: MIT.
+- Python 3.10+
+- 默认无必需依赖
+- 可选：通过 `pip install ".[pricing]"` 安装 `tokencost`
+- License: MIT
