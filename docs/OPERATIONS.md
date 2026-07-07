@@ -226,6 +226,7 @@ Two stronger interception controls:
   reverses it. Break-glass for an incident.
 - **Behavioral blocking.** Set `block_on_anomaly` in the policy (`true` blocks on any
   high-severity alert, or give a list of detector kinds) and the gateway denies a call
-  while its agent is *currently* flagged by a detector — turning after-the-fact alerts
-  into in-flight interception. It runs the detectors per guarded request, so
-  cache/precompute if the added latency matters at volume.
+  while its agent is recently flagged by a detector — turning after-the-fact alerts
+  into in-flight interception. The default enforcement lookback is 24 hours; set
+  `block_on_anomaly_lookback_hours` to tune it. It runs the detectors per guarded
+  request, so cache/precompute if the added latency matters at volume.

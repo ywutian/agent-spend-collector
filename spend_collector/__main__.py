@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 from .adapters import from_llm_usage, from_stripe_events, from_usdc_transfers, from_x402_settlements
 from .detectors import run_all
 from .gateway import (
+    GuardDecision,
     GuardRequest,
     audit_config as build_audit_config,
     cap_for_request,
@@ -896,6 +898,26 @@ def _decide_and_record(store: SpendStore, policy: dict, req: GuardRequest, *,
     return store.gateway_decision_as_dict(request_id) or decision.as_dict()
 
 
+def _record_gateway_deny(store: SpendStore, req: GuardRequest, reasons: list[str], *,
+                         request_id: str | None = None, route_type: str = "guard",
+                         route_id: str = "") -> dict:
+    request_id = _request_id(request_id)
+    existing = store.gateway_decision_as_dict(request_id)
+    if existing:
+        return existing
+    store.reserve_and_record_gateway_decision(
+        request_id=request_id,
+        req=req,
+        decision="deny",
+        reasons=reasons,
+        route_type=route_type,
+        route_id=route_id,
+    )
+    return store.gateway_decision_as_dict(request_id) or GuardDecision(
+        "deny", reasons, asdict(req), request_id=request_id
+    ).as_dict()
+
+
 def guard(args) -> dict:
     policy = _load_policy(args.policy)
     require_valid_policy(policy, env_token=os.environ.get("SPEND_GATEWAY_TOKEN"))
@@ -1181,12 +1203,21 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 return False
             resource_id, resource = route
             body = self._read_raw()
+            guard_payload = self._x402_guard_payload(resource_id, resource)
             content_reasons = inspect_content(body, policy)
             if content_reasons:
-                self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                with SpendStore(str(db_path)) as store:
+                    decision = _record_gateway_deny(
+                        store,
+                        self._guard_request(guard_payload),
+                        content_reasons,
+                        request_id=self.headers.get("x-request-id"),
+                        route_type="x402",
+                        route_id=resource_id,
+                    )
+                self._send(403, decision)
                 return True
             requirements = _x402_payment_requirements(resource)
-            guard_payload = self._x402_guard_payload(resource_id, resource)
             payment_header = self.headers.get("payment-signature") or self.headers.get("x-payment")
             if not payment_header:
                 with SpendStore(str(db_path)) as store:
@@ -1436,7 +1467,16 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                         guard_payload["request_id"] = payload["request_id"]
                     content_reasons = inspect_content(self._target_body_bytes(payload), policy)
                     if content_reasons:
-                        self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                        with SpendStore(str(db_path)) as store:
+                            decision = _record_gateway_deny(
+                                store,
+                                self._guard_request(guard_payload),
+                                content_reasons,
+                                request_id=self._request_id(guard_payload),
+                                route_type="target",
+                                route_id=str(payload["target"]),
+                            )
+                        self._send(403, decision)
                         return
                     decision = self._guard_payload(guard_payload, route_type="target", route_id=str(payload["target"]))
                     if not decision["allowed"]:
@@ -1447,11 +1487,20 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 provider_route = self._provider_route(policy)
                 if provider_route:
                     provider_id, provider, suffix = provider_route
+                    guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
                     content_reasons = inspect_content(getattr(self, "_raw_body", b""), policy)
                     if content_reasons:  # block on request content before policy/reservation
-                        self._send(403, {"decision": "deny", "allowed": False, "reasons": content_reasons})
+                        with SpendStore(str(db_path)) as store:
+                            decision = _record_gateway_deny(
+                                store,
+                                self._guard_request(guard_payload),
+                                content_reasons,
+                                request_id=self._request_id(guard_payload),
+                                route_type="provider",
+                                route_id=provider_id,
+                            )
+                        self._send(403, decision)
                         return
-                    guard_payload = self._provider_guard_payload(provider_id, provider, suffix, payload)
                     decision = self._guard_payload(guard_payload, route_type="provider", route_id=provider_id)
                     if not decision["allowed"]:
                         self._send(403, decision)

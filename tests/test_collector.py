@@ -453,6 +453,14 @@ class CollectorTest(unittest.TestCase):
                 urllib.request.urlopen(content_deny_req, timeout=2)
             self.assertEqual(err.exception.code, 403)
             self.assertEqual(calls, [{"q": "yes"}])
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                deny = store.db.execute(
+                    "SELECT decision, route_type, route_id, reasons_json FROM gateway_decisions "
+                    "WHERE route_type = 'target' AND route_id = 'ok' AND decision = 'deny'"
+                ).fetchone()
+            self.assertIsNotNone(deny)
+            self.assertIn("deny pattern", deny["reasons_json"])
 
     def test_x402_middleware_quotes_payment_requirements_before_settlement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -636,6 +644,12 @@ class CollectorTest(unittest.TestCase):
                 urllib.request.urlopen(content_blocked_req, timeout=2)
             self.assertEqual(err.exception.code, 403)
             self.assertEqual(facilitator_calls, [])
+            with SpendStore(str(db_path)) as store:
+                self.addCleanup(store.close)
+                content_decision = store.gateway_decision_as_dict("x402-content-blocked")
+            self.assertIsNotNone(content_decision)
+            self.assertEqual(content_decision["decision"], "deny")
+            self.assertEqual(content_decision["request"]["rail"], "api_x402")
 
             req = urllib.request.Request(
                 f"http://127.0.0.1:{gateway_port}/x402/scrape",
@@ -1759,6 +1773,10 @@ class CollectorTest(unittest.TestCase):
         self.assertTrue(any("blocked on anomaly" in r for r in d.reasons))
         calm = decide(store, policy, GuardRequest(x_agent_id="calm-bot", rail="llm_token", amount=0.01, x_budget_id="b"))
         self.assertEqual(calm.decision, "allow")
+        store.ingest([SpendEvent("s-later", "2026-07-02T10:00:00+00:00", "llm_token", "openai",
+                      "gpt-4o", 0.001, "USD", 10, "token", "spiky-bot", "b")])
+        old = decide(store, policy, GuardRequest(x_agent_id="spiky-bot", rail="llm_token", amount=0.01, x_budget_id="b"))
+        self.assertEqual(old.decision, "allow")
 
     def test_freeze_cli_edits_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

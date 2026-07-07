@@ -121,6 +121,31 @@ def _merchant_seen(store: SpendStore, req: GuardRequest) -> bool:
     return row is not None
 
 
+def _parse_alert_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            value = f"{value}T00:00:00+00:00"
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _latest_event_time(store: SpendStore) -> datetime | None:
+    row = store.db.execute("SELECT MAX(event_time) AS event_time FROM spend_events").fetchone()
+    return _parse_alert_time(row["event_time"] if row else "")
+
+
+def _alert_within_lookback(alert, anchor: datetime | None, lookback_hours: float) -> bool:
+    event_time = _parse_alert_time(getattr(alert, "event_time", ""))
+    if event_time is None:
+        return False
+    if anchor is None:
+        anchor = datetime.now(timezone.utc)
+    return event_time >= anchor - timedelta(hours=lookback_hours)
+
+
 _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),        # OpenAI / compatible
     re.compile(r"sk-ant-[A-Za-z0-9-]{20,}"),     # Anthropic
@@ -220,7 +245,7 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
     elif policy.get("warn_new_merchants") and not _merchant_seen(store, req):
         reasons.append(f"merchant {merchant_key} has no ledger history")
 
-    # Behavioral: block a call while its agent is currently flagged by a detector,
+    # Behavioral: block a call while its agent is recently flagged by a detector,
     # turning after-the-fact alerts into in-flight interception. `block_on_anomaly`
     # is true (block on any high-severity alert) or a list of kinds to block on.
     # ponytail: runs the detectors per guarded request; cache/precompute if the
@@ -230,8 +255,12 @@ def decide(store: SpendStore, policy: dict, req: GuardRequest) -> GuardDecision:
         from .detectors import run_all
         kinds = None if block is True else set(_list(block))
         budgets = {str(k): float(v) for k, v in (policy.get("budgets") or {}).items()}
+        lookback_hours = float(policy.get("block_on_anomaly_lookback_hours", 24))
+        anchor = _latest_event_time(store)
         for a in run_all(store, budgets):
             if a.subject != req.x_agent_id:
+                continue
+            if not _alert_within_lookback(a, anchor, lookback_hours):
                 continue
             if (kinds is None and a.severity == "high") or (kinds is not None and a.kind in kinds):
                 deny.append(f"agent {req.x_agent_id} blocked on anomaly: {a.kind} ({a.detail})")
@@ -251,7 +280,7 @@ def validate_policy(policy: dict) -> list[str]:
         "max_amount_per_hour", "warn_new_merchants", "deny_new_merchants", "agents",
         "merchants", "targets", "providers", "gateway_tokens", "reservation_ttl_seconds",
         "x402_resources", "content_guard", "frozen_agents", "frozen_budgets",
-        "block_on_anomaly",
+        "block_on_anomaly", "block_on_anomaly_lookback_hours",
     }
     content_guard_keys = {"max_bytes", "deny_patterns", "deny_secrets"}
     agent_keys = {"budgets", "rails", "max_amount", "budgets_caps", "merchants"}
@@ -291,6 +320,8 @@ def validate_policy(policy: dict) -> list[str]:
         errors.append("budgets must be an object")
     if "reservation_ttl_seconds" in policy and int(policy["reservation_ttl_seconds"]) <= 0:
         errors.append("reservation_ttl_seconds must be positive")
+    if "block_on_anomaly_lookback_hours" in policy and float(policy["block_on_anomaly_lookback_hours"]) <= 0:
+        errors.append("block_on_anomaly_lookback_hours must be positive")
 
     guard = policy.get("content_guard")
     if guard is not None:

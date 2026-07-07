@@ -19,6 +19,7 @@ class Alert:
     detail: str
     severity: str   # warn | high
     value: float
+    event_time: str = ""
 
 
 def _mad(xs: list[float], med: float) -> float:
@@ -62,20 +63,23 @@ def _is_spike(value: float, baseline: list[float], z: float = 3.5, multiple: flo
 def spend_spikes(store: SpendStore, z: float = 3.5) -> list[Alert]:
     """Per-(agent, rail) robust z-score on per-event spend."""
     rows = _rows(store)
-    groups: dict[tuple[str, str], list[float]] = {}
+    groups: dict[tuple[str, str], list] = {}
     for r in rows:
-        groups.setdefault((r["x_agent_id"], r["rail"]), []).append(r["billed_cost"])
+        groups.setdefault((r["x_agent_id"], r["rail"]), []).append(r)
 
     alerts: list[Alert] = []
-    for (agent, rail), costs in groups.items():
+    for (agent, rail), group_rows in groups.items():
+        costs = [r["billed_cost"] for r in group_rows]
         if len(costs) < 4:
             continue
         med = median(costs)
-        for c in costs:
+        for r in group_rows:
+            c = r["billed_cost"]
             if _is_spike(c, costs, z=z):
                 alerts.append(Alert(
                     "spend_spike", agent,
                     f"{rail} charge ${c:.4f} vs median ${med:.4f}", "high", c,
+                    event_time=r["event_time"],
                 ))
     return alerts
 
@@ -133,7 +137,7 @@ def multi_window_burn_rate(
                 "budget_burn_rate", budget,
                 f"{short_hours}h {short_rate:.1f}x / {long_hours}h {long_rate:.1f}x "
                 f"budget burn (${spends[short_hours]:.2f} recent)",
-                severity, short_rate,
+                severity, short_rate, event_time=now.isoformat(),
             ))
     return alerts
 
@@ -141,12 +145,14 @@ def multi_window_burn_rate(
 def spend_per_task(store: SpendStore, z: float = 3.5) -> list[Alert]:
     """Flag task/session costs that spike versus that agent's task baseline."""
     groups: dict[tuple[str, str, str], float] = {}
+    times: dict[tuple[str, str, str], str] = {}
     for r in _rows(store):
         task = r["x_session_id"] or r["x_receipt_ref"]
         if not task:
             continue
         key = (r["x_agent_id"], r["rail"], task)
         groups[key] = groups.get(key, 0.0) + r["billed_cost"]
+        times[key] = max(times.get(key, ""), r["event_time"])
 
     baselines: dict[tuple[str, str], list[float]] = {}
     for (agent, rail, _task), cost in groups.items():
@@ -160,7 +166,7 @@ def spend_per_task(store: SpendStore, z: float = 3.5) -> list[Alert]:
             alerts.append(Alert(
                 "spend_per_task", agent,
                 f"{rail} task {task} cost ${cost:.4f} vs median task ${med:.4f}",
-                "high", cost,
+                "high", cost, event_time=times.get((agent, rail, task), ""),
             ))
     return alerts
 
@@ -183,7 +189,7 @@ def new_key_spikes(store: SpendStore, *, multiple: float = 5.0, min_amount: floa
                 alerts.append(Alert(
                     "new_key_spike", r["x_agent_id"],
                     f"first {rail} charge ${cost:.2f} vs rail median ${med:.2f}",
-                    "high", cost,
+                    "high", cost, event_time=r["event_time"],
                 ))
         seen.add(identity)
         rail_history.setdefault(rail, []).append(cost)
@@ -219,7 +225,7 @@ def new_merchant_provider(store: SpendStore, *, lookback_hours: int = 24, min_am
             alerts.append(Alert(
                 "new_merchant_provider", agent,
                 f"first seen {provider_key} spend ${r['billed_cost']:.2f}",
-                "warn", r["billed_cost"],
+                "warn", r["billed_cost"], event_time=r["event_time"],
             ))
 
         ever_seen_agent.add(agent)
@@ -257,7 +263,7 @@ def off_hours_activity(store: SpendStore, *, lookback_hours: int = 24, min_amoun
             alerts.append(Alert(
                 "off_hours_activity", agent,
                 f"first activity at {t.hour:02d}:00 UTC, spend ${r['billed_cost']:.2f}",
-                "warn", r["billed_cost"],
+                "warn", r["billed_cost"], event_time=r["event_time"],
             ))
         count[agent] = count.get(agent, 0) + 1
         seen_hours.setdefault(agent, set()).add(t.hour)
