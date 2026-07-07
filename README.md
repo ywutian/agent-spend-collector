@@ -1,5 +1,9 @@
 # agent-spend-collector
 
+[![CI](https://github.com/ywutian/agent-spend-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/ywutian/agent-spend-collector/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+
 **See and govern every dollar your AI agents spend, across every rail.**
 
 A free, read-only, cross-rail **agent spend collector**. It pulls what your agents
@@ -395,7 +399,7 @@ region). Recording auto-detects token usage across **OpenAI**
 (`prompt_tokens`/`completion_tokens`), **Anthropic** (`input_tokens`/
 `output_tokens`), **Gemini** (`usageMetadata`), and **Cohere** (`meta.billed_units`).
 
-**Pricing:** install `tokencost` (`pip install spend-collector[pricing]`) for
+**Pricing:** install `tokencost` (`pip install ".[pricing]"` from a source checkout) for
 accurate, maintained rates across 400+ models. Without it, a small built-in price
 book covers common models and everything else prices at zero until added.
 
@@ -462,5 +466,5 @@ stays a product, not a feature.
 ## License & requirements
 
 Requires Python 3.10+. No required dependencies; optional `tokencost`
-(`pip install spend-collector[pricing]`) for accurate pricing across 400+ models,
+(`pip install ".[pricing]"` from a source checkout) for accurate pricing across 400+ models,
 otherwise a small built-in price book. License: MIT.
