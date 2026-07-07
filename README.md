@@ -90,80 +90,133 @@ The demo fixtures intentionally trigger several alerts so you can see the produc
 
 ### Real Data
 
-Fast path: copy the example config, fill in only the rails you use, then pull everything configured into the same ledger.
+Use one config file for normal runs. Enable only the rails you use, keep secrets in environment variables, then run `pull-all`.
 
 ```bash
 cp spend.config.example.json spend.config.json
-# edit spend.config.json
+# edit spend.config.json once
+```
+
+Example `spend.config.json`:
+
+```json
+{
+  "db": "spend.db",
+  "out_dir": "artifacts",
+  "days": 7,
+  "budgets": {
+    "team-research": 50.0,
+    "team-support": 25.0,
+    "default": 100.0
+  },
+  "wallets": {
+    "0xresearchwallet": {
+      "agent_id": "research-bot",
+      "budget_id": "team-research"
+    }
+  },
+  "rails": {
+    "llm": {
+      "enabled": true,
+      "provider": "anthropic",
+      "api_key_env": "ANTHROPIC_ADMIN_KEY"
+    },
+    "stripe": {
+      "enabled": true,
+      "api_key_env": "STRIPE_SECRET_KEY"
+    },
+    "x402": {
+      "enabled": true,
+      "pay_to": "0xYourX402ReceivingAddress"
+    },
+    "usdc": {
+      "enabled": true,
+      "pay_to": "0xYourUSDCReceivingAddress"
+    },
+    "aws": {
+      "enabled": false,
+      "tag_agent": "agent_id",
+      "tag_budget": "budget_id"
+    }
+  }
+}
+```
+
+Set the environment variables named in the config:
+
+```bash
+export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
+export STRIPE_SECRET_KEY=rk_live_...
+```
+
+Edit checklist:
+
+| Field | What to put there |
+|---|---|
+| `budgets` | Budget caps by team, agent group, or environment |
+| `wallets` | Wallet address -> `agent_id` and `budget_id` mapping |
+| `rails.*.enabled` | `true` for sources you want `pull-all` to ingest |
+| `rails.*.api_key_env` | Environment variable name that holds the provider key |
+| `rails.x402.pay_to` / `rails.usdc.pay_to` | Receiving address to scan on Base |
+
+Pull every enabled rail and render the dashboard:
+
+```bash
 python3 -m spend_collector pull-all --config spend.config.json
 ```
 
-Common single-rail pulls:
+That writes to the configured `db`, runs detectors, and creates `report.html`, `alerts.json`, and `run-summary.json` in the configured `out_dir`.
+
+Single-rail commands still exist for debugging one source at a time:
 
 ```bash
-# LLM cost: Anthropic or OpenAI
-export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
-python3 -m spend_collector pull --provider anthropic --db spend.db --days 7 --out-dir artifacts
-
-# OpenRouter generation metadata
-export OPENROUTER_API_KEY=sk-or-...
-python3 -m spend_collector pull-openrouter --generation-id gen_... --db spend.db --out-dir artifacts
-
-# Stripe card payments
-export STRIPE_SECRET_KEY=rk_live_...
-python3 -m spend_collector pull-stripe --db spend.db --days 7 --out-dir artifacts
-
-# Base USDC / x402
-python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
-python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
-```
-
-Cloud examples:
-
-```bash
-python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id
+python3 -m spend_collector pull --provider anthropic
+python3 -m spend_collector pull-stripe
+python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress
+python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress
+python3 -m spend_collector pull-aws
 python3 -m spend_collector pull-gcp-billing-file --billing-export-file gcp-billing-export.ndjson
 python3 -m spend_collector pull-azure --scope "$AZURE_COST_SCOPE"
 ```
 
-Budget caps can be supplied with `SPEND_BUDGETS_FILE`:
-
-```bash
-export SPEND_BUDGETS_FILE=budgets.json
-```
-
-Example:
-
-```json
-{
-  "team-research": 10.0,
-  "team-support": 8.0
-}
-```
-
-For scheduling, retention, webhooks, and incident handling, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+For OpenRouter, add a rail with `provider: "openrouter"` and `generation_ids` or `generation_ids_file`. For cloud spend, enable the cloud rail and set the provider credentials in env vars. For scheduling, retention, webhooks, and incident handling, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ### Pre-Spend Gateway
 
-The collector can also run as a local gateway. Agents ask before spending; the gateway returns `allow` or `deny` from policy plus ledger history.
+The gateway is the inline control layer. Use it when an agent can ask before it spends, or when you can route the agent's API calls through a local proxy.
 
-Try a one-off decision:
+Minimal policy, saved as `gateway.example.json`:
 
-```bash
-python3 -m spend_collector guard \
-  --policy gateway.example.json \
-  --db spend.db \
-  --agent research-bot \
-  --rail api_x402 \
-  --provider x402 \
-  --merchant 0xtool \
-  --service /scrape \
-  --amount 3.50 \
-  --budget team-research \
-  --enforce-exit-code
+```json
+{
+  "gateway_tokens": ["dev-gateway-token"],
+  "budgets": {
+    "team-research": 10.0
+  },
+  "max_amount": 3.0,
+  "agents": {
+    "research-bot": {
+      "budgets": ["team-research"],
+      "rails": ["llm_token", "api_x402"],
+      "max_amount": 2.0
+    }
+  },
+  "targets": {
+    "scraper-demo": {
+      "url": "https://example.com/scrape",
+      "method": "POST",
+      "rail": "api_x402",
+      "provider": "x402",
+      "merchant": "0xtool",
+      "service": "/scrape",
+      "amount": 1.5,
+      "budget": "team-research"
+    }
+  }
+}
 ```
 
-Run the HTTP gateway:
+Start it:
 
 ```bash
 export SPEND_GATEWAY_TOKEN=dev-gateway-token
@@ -171,25 +224,63 @@ python3 -m spend_collector validate-policy --policy gateway.example.json
 python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
 ```
 
-Call it before a spend:
+Example 1: ask for a decision before spending.
 
 ```bash
 curl -X POST http://127.0.0.1:8787/guard \
   -H "content-type: application/json" \
   -H "authorization: Bearer dev-gateway-token" \
-  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":3.5,"budget":"team-research"}'
+  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":1.5,"budget":"team-research"}'
 ```
 
-The gateway can also:
+Allowed response:
 
-- proxy allowlisted API calls with `/forward`
-- proxy OpenAI-compatible provider routes after policy checks
-- serve x402 resources at `/x402/<resource-id>`
-- create and release short-lived spend reservations
-- freeze or unfreeze agents and budgets as an incident kill-switch
-- block on deterministic request-content rules or recent anomalies
+```json
+{
+  "decision": "allow",
+  "allowed": true,
+  "reasons": []
+}
+```
 
-See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and [`SECURITY.md`](SECURITY.md) before using the gateway in production.
+If the amount, rail, agent, or budget violates policy, the gateway returns `deny` and the caller should stop the spend.
+
+Example 2: let the gateway proxy an allowlisted paid API.
+
+```bash
+curl -X POST http://127.0.0.1:8787/forward \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer dev-gateway-token" \
+  -d '{"agent":"research-bot","target":"scraper-demo","body":{"query":"pricing data"}}'
+```
+
+The gateway checks the same policy first. If denied, it does not call the upstream URL. If allowed, it forwards the body and records the estimated spend.
+
+Example 3: put an OpenAI-compatible provider behind the gateway.
+
+```json
+{
+  "providers": {
+    "openai": {
+      "api_key_env": "OPENAI_API_KEY",
+      "budget": "team-research",
+      "amount": 0.25
+    }
+  }
+}
+```
+
+Then point the agent SDK at:
+
+```text
+base_url = http://127.0.0.1:8787/openai/v1
+api_key = dev-gateway-token
+headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
+```
+
+The real provider key stays on the gateway. The agent only gets the gateway token.
+
+For x402 seller-side middleware, freeze/unfreeze, content guards, anomaly-based blocking, and production safety notes, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and [`SECURITY.md`](SECURITY.md).
 
 ### Dashboard
 
@@ -326,80 +417,133 @@ demo 数据会故意触发多个告警，方便你一跑就看到效果。
 
 ### 接入真实数据
 
-最快方式：复制示例配置，只填你实际用到的数据来源，然后统一拉入同一个账本。
+正常使用时建议只走一个配置文件。你只需要启用自己用到的数据来源，把密钥放在环境变量里，然后运行 `pull-all`。
 
 ```bash
 cp spend.config.example.json spend.config.json
-# edit spend.config.json
+# 只需要编辑一次 spend.config.json
+```
+
+示例 `spend.config.json`：
+
+```json
+{
+  "db": "spend.db",
+  "out_dir": "artifacts",
+  "days": 7,
+  "budgets": {
+    "team-research": 50.0,
+    "team-support": 25.0,
+    "default": 100.0
+  },
+  "wallets": {
+    "0xresearchwallet": {
+      "agent_id": "research-bot",
+      "budget_id": "team-research"
+    }
+  },
+  "rails": {
+    "llm": {
+      "enabled": true,
+      "provider": "anthropic",
+      "api_key_env": "ANTHROPIC_ADMIN_KEY"
+    },
+    "stripe": {
+      "enabled": true,
+      "api_key_env": "STRIPE_SECRET_KEY"
+    },
+    "x402": {
+      "enabled": true,
+      "pay_to": "0xYourX402ReceivingAddress"
+    },
+    "usdc": {
+      "enabled": true,
+      "pay_to": "0xYourUSDCReceivingAddress"
+    },
+    "aws": {
+      "enabled": false,
+      "tag_agent": "agent_id",
+      "tag_budget": "budget_id"
+    }
+  }
+}
+```
+
+设置配置里写到的环境变量：
+
+```bash
+export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
+export STRIPE_SECRET_KEY=rk_live_...
+```
+
+编辑时主要看这几个字段：
+
+| 字段 | 填什么 |
+|---|---|
+| `budgets` | 按团队、Agent 组或环境设置预算上限 |
+| `wallets` | 钱包地址到 `agent_id` 和 `budget_id` 的映射 |
+| `rails.*.enabled` | 需要 `pull-all` 拉取的来源设为 `true` |
+| `rails.*.api_key_env` | 存放 provider key 的环境变量名 |
+| `rails.x402.pay_to` / `rails.usdc.pay_to` | 需要扫描的 Base 收款地址 |
+
+一条命令拉取所有已启用的数据来源，并生成看板：
+
+```bash
 python3 -m spend_collector pull-all --config spend.config.json
 ```
 
-常见单来源拉取：
+它会写入配置里的 `db`，运行检测器，并在配置里的 `out_dir` 生成 `report.html`、`alerts.json` 和 `run-summary.json`。
+
+单源命令仍然保留，但更适合用来调试某一个来源：
 
 ```bash
-# LLM cost: Anthropic or OpenAI
-export ANTHROPIC_ADMIN_KEY=sk-ant-admin01-...
-python3 -m spend_collector pull --provider anthropic --db spend.db --days 7 --out-dir artifacts
-
-# OpenRouter generation metadata
-export OPENROUTER_API_KEY=sk-or-...
-python3 -m spend_collector pull-openrouter --generation-id gen_... --db spend.db --out-dir artifacts
-
-# Stripe card payments
-export STRIPE_SECRET_KEY=rk_live_...
-python3 -m spend_collector pull-stripe --db spend.db --days 7 --out-dir artifacts
-
-# Base USDC / x402
-python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
-python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress --wallet-map wallet-map.example.json
-```
-
-云账单示例：
-
-```bash
-python3 -m spend_collector pull-aws --tag-agent agent_id --tag-budget budget_id
+python3 -m spend_collector pull --provider anthropic
+python3 -m spend_collector pull-stripe
+python3 -m spend_collector pull-usdc --pay-to 0xYourReceivingAddress
+python3 -m spend_collector pull-x402 --pay-to 0xYourReceivingAddress
+python3 -m spend_collector pull-aws
 python3 -m spend_collector pull-gcp-billing-file --billing-export-file gcp-billing-export.ndjson
 python3 -m spend_collector pull-azure --scope "$AZURE_COST_SCOPE"
 ```
 
-预算可以通过 `SPEND_BUDGETS_FILE` 提供：
-
-```bash
-export SPEND_BUDGETS_FILE=budgets.json
-```
-
-示例：
-
-```json
-{
-  "team-research": 10.0,
-  "team-support": 8.0
-}
-```
-
-生产调度、产物保留、webhook 告警和事件处理请看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
+OpenRouter 可以在配置里把 `provider` 设成 `"openrouter"`，并配置 `generation_ids` 或 `generation_ids_file`。云账单同理，启用对应 rail，再通过环境变量提供云厂商凭据。生产调度、产物保留、webhook 告警和事件处理请看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
 
 ### 花钱前拦截网关
 
-这个项目也可以作为本地网关运行。Agent 在花钱前先问网关，网关根据策略和历史账本返回 `allow` 或 `deny`。
+网关是“花钱前”的控制层。适合两种场景：Agent 能在花钱前先问一下，或者你能把 Agent 的 API 请求先路由到本地网关。
 
-单次决策示例：
+最小策略示例，保存为 `gateway.example.json`：
 
-```bash
-python3 -m spend_collector guard \
-  --policy gateway.example.json \
-  --db spend.db \
-  --agent research-bot \
-  --rail api_x402 \
-  --provider x402 \
-  --merchant 0xtool \
-  --service /scrape \
-  --amount 3.50 \
-  --budget team-research \
-  --enforce-exit-code
+```json
+{
+  "gateway_tokens": ["dev-gateway-token"],
+  "budgets": {
+    "team-research": 10.0
+  },
+  "max_amount": 3.0,
+  "agents": {
+    "research-bot": {
+      "budgets": ["team-research"],
+      "rails": ["llm_token", "api_x402"],
+      "max_amount": 2.0
+    }
+  },
+  "targets": {
+    "scraper-demo": {
+      "url": "https://example.com/scrape",
+      "method": "POST",
+      "rail": "api_x402",
+      "provider": "x402",
+      "merchant": "0xtool",
+      "service": "/scrape",
+      "amount": 1.5,
+      "budget": "team-research"
+    }
+  }
+}
 ```
 
-启动 HTTP 网关：
+启动网关：
 
 ```bash
 export SPEND_GATEWAY_TOKEN=dev-gateway-token
@@ -407,25 +551,63 @@ python3 -m spend_collector validate-policy --policy gateway.example.json
 python3 -m spend_collector gateway --policy gateway.example.json --db spend.db
 ```
 
-花钱前调用：
+示例 1：花钱前先问能不能花。
 
 ```bash
 curl -X POST http://127.0.0.1:8787/guard \
   -H "content-type: application/json" \
   -H "authorization: Bearer dev-gateway-token" \
-  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":3.5,"budget":"team-research"}'
+  -d '{"agent":"research-bot","rail":"api_x402","provider":"x402","merchant":"0xtool","service":"/scrape","amount":1.5,"budget":"team-research"}'
 ```
 
-网关还可以：
+允许时返回类似：
 
-- 通过 `/forward` 代理 allowlist 里的 API 请求
-- 在策略检查后代理 OpenAI-compatible provider routes
-- 通过 `/x402/<resource-id>` 提供 x402 资源
-- 创建和释放短期花费预留
-- 冻结或解冻 agent / budget，作为事故 kill-switch
-- 根据确定性的请求内容规则或近期异常进行阻断
+```json
+{
+  "decision": "allow",
+  "allowed": true,
+  "reasons": []
+}
+```
 
-生产使用网关前，请先看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 和 [`SECURITY.md`](SECURITY.md)。
+如果金额、通道、Agent 或预算不符合策略，网关会返回 `deny`，调用方应该停止这次花费。
+
+示例 2：让网关代理一个 allowlist 里的付费 API。
+
+```bash
+curl -X POST http://127.0.0.1:8787/forward \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer dev-gateway-token" \
+  -d '{"agent":"research-bot","target":"scraper-demo","body":{"query":"pricing data"}}'
+```
+
+网关会先跑同一套策略。拒绝时不会请求上游 URL；允许时才转发 body，并记录这次预估花费。
+
+示例 3：把 OpenAI-compatible provider 放到网关后面。
+
+```json
+{
+  "providers": {
+    "openai": {
+      "api_key_env": "OPENAI_API_KEY",
+      "budget": "team-research",
+      "amount": 0.25
+    }
+  }
+}
+```
+
+然后把 Agent SDK 指到：
+
+```text
+base_url = http://127.0.0.1:8787/openai/v1
+api_key = dev-gateway-token
+headers = {"X-Agent-ID": "research-bot", "X-Budget-ID": "team-research"}
+```
+
+真实 provider key 只放在网关进程里，Agent 只拿 gateway token。
+
+x402 seller-side middleware、freeze/unfreeze、content guard、根据近期异常阻断和生产安全说明请看 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) 和 [`SECURITY.md`](SECURITY.md)。
 
 ### 看板
 
