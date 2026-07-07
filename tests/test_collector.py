@@ -454,7 +454,6 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(err.exception.code, 403)
             self.assertEqual(calls, [{"q": "yes"}])
             with SpendStore(str(db_path)) as store:
-                self.addCleanup(store.close)
                 deny = store.db.execute(
                     "SELECT decision, route_type, route_id, reasons_json FROM gateway_decisions "
                     "WHERE route_type = 'target' AND route_id = 'ok' AND decision = 'deny'"
@@ -645,7 +644,6 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(err.exception.code, 403)
             self.assertEqual(facilitator_calls, [])
             with SpendStore(str(db_path)) as store:
-                self.addCleanup(store.close)
                 content_decision = store.gateway_decision_as_dict("x402-content-blocked")
             self.assertIsNotNone(content_decision)
             self.assertEqual(content_decision["decision"], "deny")
@@ -685,7 +683,6 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(err.exception.code, 409)
 
             with SpendStore(str(db_path)) as store:
-                self.addCleanup(store.close)
                 row = store.db.execute(
                     "SELECT rail, provider_name, billed_cost, billing_currency, x_agent_id, "
                     "x_budget_id, x_receipt_ref FROM spend_events"
@@ -747,7 +744,8 @@ class CollectorTest(unittest.TestCase):
             db_path = Path(tmp) / "spend.db"
             policy_path = Path(tmp) / "policy.json"
             policy = {
-                "max_amount": 1.0,
+                "max_amount": 3.0,
+                "budgets": {"team-research": 1.0},
                 "gateway_tokens": ["agent-gateway-token"],
                 "providers": {
                     "openai": {
@@ -806,6 +804,29 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(calls[0]["auth"], "Bearer sk-provider-secret")
             self.assertEqual(calls[0]["agent"], None)
             self.assertEqual(calls[0]["body"], body)
+
+            worst_case_req = urllib.request.Request(
+                f"http://127.0.0.1:{gateway_port}/openai/v1/chat/completions",
+                data=json.dumps({
+                    "model": "gpt-4o",
+                    "max_tokens": 100_001,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": "Bearer agent-gateway-token",
+                    "x-agent-id": "research-bot",
+                    "x-budget-id": "team-research",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(worst_case_req, timeout=2)
+            self.assertEqual(err.exception.code, 403)
+            payload = json.loads(err.exception.read())
+            self.assertEqual(payload["decision"], "deny")
+            self.assertTrue(any("would exceed cap" in r for r in payload["reasons"]))
+            self.assertEqual(len(calls), 1)
 
             deny_req = urllib.request.Request(
                 f"http://127.0.0.1:{gateway_port}/openai_blocked/v1/chat/completions",

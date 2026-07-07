@@ -1012,7 +1012,7 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_upstream(self, resp, extra_headers: dict | None = None) -> bytes | None:
+        def _send_upstream(self, resp, extra_headers: dict | None = None, on_body=None) -> bytes | None:
             headers = dict(resp.headers.items())
             content_type = headers.get("Content-Type", headers.get("content-type", ""))
             is_stream = _is_event_stream(content_type)
@@ -1025,6 +1025,8 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 self.send_header(str(key), str(value))
             if not is_stream:
                 body = resp.read()
+                if on_body is not None:
+                    on_body(body)
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -1040,7 +1042,10 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 tail += chunk
                 if len(tail) > 65536:
                     del tail[:-65536]
-            return _usage_body_from_sse(bytes(tail))
+            raw = _usage_body_from_sse(bytes(tail))
+            if on_body is not None:
+                on_body(raw)
+            return raw
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("content-length", "0"))
@@ -1411,23 +1416,22 @@ def make_gateway_server(db_path: str | Path = "spend.db", policy_path: str | Pat
                 headers=self._provider_headers(provider),
                 method=method,
             )
+
+            def close_hold(store: SpendStore, raw: bytes | None = None) -> None:
+                if raw is not None and guard_payload is not None:
+                    record_forwarded_spend(store, raw, provider, guard_payload)
+                if request_id:
+                    store.release_reservation(request_id)
+
             try:
                 with urllib.request.urlopen(req, timeout=float(provider.get("timeout", 30))) as resp:
-                    raw = self._send_upstream(resp)
-                # Close the loop: record the actual spend from the response usage.
-                if raw is not None and guard_payload is not None:
                     with SpendStore(str(db_path)) as store:
-                        record_forwarded_spend(store, raw, provider, guard_payload)
+                        self._send_upstream(resp, on_body=lambda raw: close_hold(store, raw))
             except urllib.error.HTTPError as exc:
-                self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
-            finally:
-                # Always release the pre-spend hold once the call returns: any recorded
-                # spend is already in the ledger, and leaving a worst-case hold to its TTL
-                # would over-deny later calls. Unmeasured spend (e.g. a stream without
-                # usage) is reconciled by the read-only pull, not by a lingering hold.
                 if request_id:
                     with SpendStore(str(db_path)) as store:
                         store.release_reservation(request_id)
+                self._send_bytes(exc.code, exc.read(), dict(exc.headers.items()))
 
         def do_GET(self) -> None:
             parsed = urllib.parse.urlsplit(self.path)
