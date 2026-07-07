@@ -126,6 +126,15 @@ downstream call fails before money moves:
 python3 -m spend_collector release-reservation --db spend.db --request-id req_123
 ```
 
+For LLM provider forwards the hold is the request's **worst-case** cost, not a flat
+number: the gateway prices the model at the estimated input tokens plus the request's
+`max_tokens` (falling back to a per-provider `max_output_tokens` cap when the request
+sets no limit). So a single `max_tokens: 100000` call reserves its true ceiling up
+front and the budget cap can deny it *before* the spend. If a request sets no
+`max_tokens` and the provider has no `max_output_tokens`, the hold stays the flat
+configured `amount` / `max_estimated_amount`. The hold is released as soon as the call
+returns and the actual token cost lands in the ledger.
+
 ## Live Dashboard and Service Restart
 
 A running gateway also serves the dashboard live at `GET /dashboard`, token-gated
